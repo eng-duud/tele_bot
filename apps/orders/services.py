@@ -106,6 +106,12 @@ class OrderService:
                     to_status='PROCESSING',
                     notes="تم تحويل الطلب لمعالجة المزود الخارجي."
                 )
+                # Publish only after checkout commits. A fast worker must not
+                # process an order that later rolls back.
+                from apps.fulfillment.services import FulfillmentService
+                transaction.on_commit(
+                    lambda order=order: FulfillmentService.queue_fulfillment(order)
+                )
 
             elif product.fulfillment_type == 'MANUAL':
                 order.status = 'PROCESSING'
@@ -116,6 +122,12 @@ class OrderService:
                     from_status='PENDING',
                     to_status='PROCESSING',
                     notes="الطلب بانتظار التنفيذ اليدوي من الإدارة."
+                )
+            else:
+                # FILE is declared in the choices but has no implementation.
+                # Never debit a customer for an order that cannot progress.
+                raise ValueError(
+                    f"نوع التسليم '{product.fulfillment_type}' غير مدعوم حالياً."
                 )
 
             return order, delivered_secrets

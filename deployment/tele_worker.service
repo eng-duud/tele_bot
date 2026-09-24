@@ -1,0 +1,17 @@
+[Unit]
+Description=Celery Worker for Telegram Store Fulfillment
+After=network.target redis-server.service
+
+[Service]
+Type=simple
+User=telebot
+WorkingDirectory=/var/www/tele_bot
+EnvironmentFile=/var/www/tele_bot/.env
+ExecStart=/var/www/tele_bot/venv/bin/celery -A config worker --loglevel=INFO --concurrency=2
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
