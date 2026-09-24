@@ -3,7 +3,11 @@ import logging
 from django.core.management.base import BaseCommand
 from aiogram import Dispatcher
 from apps.telegram_bot.common.bot_instances import get_customer_bot
-from apps.telegram_bot.common.middlewares import UserAutoRegisterMiddleware, MandatorySubscriptionMiddleware
+from apps.telegram_bot.common.middlewares import (
+    UserAutoRegisterMiddleware,
+    MandatorySubscriptionMiddleware,
+    CallbackRateLimitMiddleware,
+)
 from apps.telegram_bot.customer.handlers import start, shop, wallet, orders, services, settings
 from apps.telegram_bot.admin_group import handlers as admin_group_handlers
 
@@ -27,6 +31,7 @@ class Command(BaseCommand):
         dp.callback_query.middleware(UserAutoRegisterMiddleware())
         dp.message.middleware(MandatorySubscriptionMiddleware())
         dp.callback_query.middleware(MandatorySubscriptionMiddleware())
+        dp.callback_query.middleware(CallbackRateLimitMiddleware())
 
         # Include Routers
         dp.include_router(start.router)

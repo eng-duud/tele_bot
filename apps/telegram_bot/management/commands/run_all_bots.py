@@ -9,7 +9,8 @@ from apps.telegram_bot.common.bot_instances import get_customer_bot, get_admin_b
 from apps.telegram_bot.common.middlewares import (
     UserAutoRegisterMiddleware, 
     MandatorySubscriptionMiddleware,
-    AdminAuthMiddleware
+    AdminAuthMiddleware,
+    CallbackRateLimitMiddleware,
 )
 from apps.telegram_bot.customer.handlers import start, shop, wallet, orders, services, settings
 from apps.telegram_bot.admin import handlers as admin_handlers
@@ -53,6 +54,7 @@ class Command(BaseCommand):
             cust_dp.callback_query.middleware(UserAutoRegisterMiddleware())
             cust_dp.message.middleware(MandatorySubscriptionMiddleware())
             cust_dp.callback_query.middleware(MandatorySubscriptionMiddleware())
+            cust_dp.callback_query.middleware(CallbackRateLimitMiddleware())
 
             cust_dp.include_router(start.router)
             cust_dp.include_router(shop.router)

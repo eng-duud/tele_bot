@@ -39,9 +39,14 @@ async def handle_wallet_menu(event: Message | CallbackQuery, user_profile: Teleg
 
 
 @router.callback_query(F.data == "wallet_deposit")
-async def handle_start_deposit(callback: CallbackQuery):
+async def handle_start_deposit(callback: CallbackQuery, user_profile: TelegramProfile):
     """Display available payment methods."""
     await callback.answer()
+    block_reason = await sync_to_async(PaymentService.get_top_up_block_reason)(user_profile)
+    if block_reason:
+        await callback.message.answer(f"⏳ {block_reason}")
+        return
+
     methods = await sync_to_async(list)(PaymentMethod.objects.filter(is_active=True))
     if not methods:
         await callback.message.answer("عذراً، لا توجد طرق دفع مفعلة حالياً. يرجى التواصل مع الإدارة.")
@@ -190,14 +195,19 @@ async def handle_deposit_proof_photo(message: Message, user_profile: TelegramPro
     # Telegram keeps the file on its servers; the largest photo variant gives
     # the admin the best review quality while storing only a small file_id.
     proof_image_file_id = message.photo[-1].file_id
-    req = await sync_to_async(PaymentService.create_payment_request)(
-        user=user_profile,
-        payment_method=method,
-        amount_yer=amount,
-        tx_number=tx_number,
-        proof_image_file_id=proof_image_file_id,
-        proof_image_url=""
-    )
+    try:
+        req = await sync_to_async(PaymentService.create_payment_request)(
+            user=user_profile,
+            payment_method=method,
+            amount_yer=amount,
+            tx_number=tx_number,
+            proof_image_file_id=proof_image_file_id,
+            proof_image_url=""
+        )
+    except ValueError as exc:
+        await state.clear()
+        await message.answer(f"⏳ {exc}", reply_markup=get_customer_main_menu())
+        return
     await state.clear()
 
     await AdminGroupNotifierService.send_payment_request_card(bot, req)

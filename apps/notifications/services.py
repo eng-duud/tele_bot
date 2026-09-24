@@ -119,14 +119,16 @@ class ChannelSubscriptionService:
                         f"البوت ليس مشرفاً (Admin) في القناة أو المعرف غير صحيح! "
                         f"يرجى إضافة البوت مشرفاً في القناة أولاً لكي يتمكن من فحص الأعضاء. تفاصيل الخطأ: {e}"
                     )
-                    # Don't trap users if bot has no access to the channel yet
-                    continue
+                    # Fail closed: if membership cannot be verified, do not
+                    # grant access. Otherwise a user could bypass a mandatory
+                    # channel simply because the bot lost admin permissions.
+                    missing.append(ch)
                 else:
                     logger.warning(f"TelegramBadRequest for user {telegram_user_id} in {ch.channel_id}: {e}")
                     missing.append(ch)
             except Exception as e:
                 logger.warning(f"Unexpected error checking membership for {telegram_user_id} in {ch.channel_id}: {e}")
-                continue
+                missing.append(ch)
 
         return missing
 
@@ -748,4 +750,3 @@ class CustomerNotifierService:
                 async_to_sync(_deliver)()
         except Exception as ex:
             logger.error(f"Error dispatching customer refund alert: {ex}")
-

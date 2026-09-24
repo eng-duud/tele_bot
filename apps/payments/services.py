@@ -2,12 +2,28 @@ from decimal import Decimal
 from typing import Tuple, Optional
 from django.db import transaction
 from django.utils import timezone
+from datetime import timedelta
 from apps.users.models import TelegramProfile
 from apps.payments.models import PaymentMethod, PaymentRequest
 from apps.wallet.services import WalletService
 
 class PaymentService:
     """Service handling customer top-up submissions and idempotent admin approvals."""
+
+    @staticmethod
+    def get_top_up_block_reason(user: TelegramProfile) -> str:
+        """Return a user-facing reason when a new top-up should be delayed."""
+        now = timezone.now()
+        if PaymentRequest.objects.filter(user=user, status='PENDING').exists():
+            return "لديك طلب شحن قيد المراجعة بالفعل. انتظر نتيجته قبل إرسال طلب جديد."
+
+        recent_count = PaymentRequest.objects.filter(
+            user=user,
+            created_at__gte=now - timedelta(minutes=10),
+        ).exclude(status='REJECTED').count()
+        if recent_count >= 3:
+            return "تم الوصول إلى حد طلبات الشحن المؤقت (3 طلبات خلال 10 دقائق). حاول لاحقاً."
+        return ""
 
     @staticmethod
     def create_payment_request(
@@ -25,15 +41,23 @@ class PaymentService:
         if amount_yer > payment_method.max_deposit_yer:
             raise ValueError(f"المبلغ يتجاوز الحد الأقصى المسموح ({payment_method.max_deposit_yer:,.0f} YER).")
 
-        return PaymentRequest.objects.create(
-            user=user,
-            payment_method=payment_method,
-            amount_yer=amount_yer,
-            tx_number=tx_number.strip(),
-            proof_image_file_id=proof_image_file_id,
-            proof_image_url=proof_image_url,
-            status='PENDING'
-        )
+        # Lock the profile so two rapid submissions cannot both pass the
+        # pending/rate-limit checks in separate bot updates.
+        from apps.users.models import TelegramProfile as Profile
+        with transaction.atomic():
+            locked_user = Profile.objects.select_for_update().get(id=user.id)
+            block_reason = PaymentService.get_top_up_block_reason(locked_user)
+            if block_reason:
+                raise ValueError(block_reason)
+            return PaymentRequest.objects.create(
+                user=locked_user,
+                payment_method=payment_method,
+                amount_yer=amount_yer,
+                tx_number=tx_number.strip(),
+                proof_image_file_id=proof_image_file_id,
+                proof_image_url=proof_image_url,
+                status='PENDING'
+            )
 
     @classmethod
     def approve_payment(

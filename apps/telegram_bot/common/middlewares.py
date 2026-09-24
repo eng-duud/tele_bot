@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 # Fast in-memory user cache: telegram_id -> (profile, timestamp)
 _USER_CACHE: Dict[int, Tuple[TelegramProfile, float]] = {}
 CACHE_TTL = 30.0  # 30 seconds for user profile registration check
+_CALLBACK_HISTORY: Dict[int, list[float]] = {}
+CALLBACK_WINDOW_SECONDS = 3.0
+CALLBACK_MAX_IN_WINDOW = 8
 
 class UserAutoRegisterMiddleware(BaseMiddleware):
     """Automatically synchronizes Telegram users with the Django backend and provides fresh wallet state."""
@@ -51,6 +54,14 @@ class UserAutoRegisterMiddleware(BaseMiddleware):
             data["user_profile"] = profile
             data["user_wallet"] = wallet
 
+            super_admin_id = getattr(settings, 'SUPER_ADMIN_TELEGRAM_ID', 0)
+            if profile.is_banned and user.id != super_admin_id:
+                if isinstance(event, CallbackQuery):
+                    await event.answer("⛔ حسابك موقوف حالياً. تواصل مع الإدارة.", show_alert=True)
+                elif isinstance(event, Message):
+                    await event.answer("⛔ حسابك موقوف حالياً. تواصل مع الإدارة.")
+                return
+
         return await handler(event, data)
 
 
@@ -75,6 +86,41 @@ class AdminAuthMiddleware(BaseMiddleware):
                 await event.answer("⛔ *عذراً، هذا البوت مخصص للمشرفين وإدارة المتجر فقط.*", parse_mode='Markdown')
             return
 
+        return await handler(event, data)
+
+
+class CallbackRateLimitMiddleware(BaseMiddleware):
+    """Ignore accidental callback-button bursts without affecting normal use."""
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        user = data.get("event_from_user")
+        if not user or user.is_bot or not isinstance(event, CallbackQuery):
+            return await handler(event, data)
+
+        # Keep subscription verification responsive while the user joins the
+        # required channels.
+        if event.data and event.data.startswith("check_sub"):
+            return await handler(event, data)
+
+        now = time.monotonic()
+        history = [
+            timestamp for timestamp in _CALLBACK_HISTORY.get(user.id, [])
+            if now - timestamp < CALLBACK_WINDOW_SECONDS
+        ]
+        if len(history) >= CALLBACK_MAX_IN_WINDOW:
+            _CALLBACK_HISTORY[user.id] = history
+            await event.answer("⏳ تم الضغط بسرعة كبيرة. انتظر لحظة ثم حاول مرة أخرى.", show_alert=True)
+            return
+
+        history.append(now)
+        _CALLBACK_HISTORY[user.id] = history
+        if len(_CALLBACK_HISTORY) > 10000:
+            _CALLBACK_HISTORY.clear()
         return await handler(event, data)
 
 
