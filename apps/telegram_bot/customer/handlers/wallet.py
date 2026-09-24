@@ -119,21 +119,10 @@ async def handle_deposit_amount_entered(message: Message, state: FSMContext):
 
 @router.message(DepositStates.waiting_for_tx_number)
 async def handle_deposit_tx_number_received(message: Message, user_profile: TelegramProfile, state: FSMContext, bot):
-    """Validate tx number, check for duplicates, and submit deposit request without photo."""
+    """Validate the transaction number, then request the transfer receipt photo."""
     import html
 
-    # If user sent a photo or document instead of text
-    if message.photo or message.document:
-        tx_number = message.caption.strip() if message.caption else ""
-        if not tx_number:
-            await message.answer(
-                "⚠️ <b>لا يلزم إرسال صورة إطلاقاً!</b>\n"
-                "يرجى فقط كتابة وإرسال <b>رقم العملية أو الحوالة كنص</b> (مثال: <code>8492015</code>):",
-                parse_mode='HTML'
-            )
-            return
-    else:
-        tx_number = message.text.strip() if message.text else ""
+    tx_number = message.text.strip() if message.text else ""
 
     txt = tx_number.lower()
     if txt in ("/cancel", "إلغاء", "رجوع", "الغاء"):
@@ -161,26 +150,59 @@ async def handle_deposit_tx_number_received(message: Message, user_profile: Tele
         )
         return
 
+    await state.update_data(tx_number=tx_number)
+    await state.set_state(DepositStates.waiting_for_proof_photo)
+    await message.answer(
+        "📸 <b>الخطوة 3:</b> أرسل الآن <b>صورة إشعار التحويل</b> كصورة من Telegram.\n\n"
+        "يجب أن تكون الصورة واضحة وتظهر المبلغ ورقم العملية، أو اكتب <b>إلغاء</b> للتراجع.",
+        parse_mode='HTML'
+    )
+
+
+@router.message(DepositStates.waiting_for_proof_photo)
+async def handle_deposit_proof_photo(message: Message, user_profile: TelegramProfile, state: FSMContext, bot):
+    """Persist the Telegram photo file_id and submit the complete request."""
+    import html
+
+    txt = message.text.strip().lower() if message.text else ""
+    if txt in ("/cancel", "إلغاء", "رجوع", "الغاء"):
+        await state.clear()
+        await message.answer("❌ تم إلغاء طلب الشحن بنجاح.", reply_markup=get_customer_main_menu())
+        return
+
+    if not message.photo:
+        await message.answer(
+            "⚠️ لم تصل صورة التحويل. أرسلها كـ <b>صورة Telegram</b> واضحة، أو اكتب <b>إلغاء</b> للتراجع.",
+            parse_mode='HTML'
+        )
+        return
+
     data = await state.get_data()
     method_id = data.get("payment_method_id")
     amount = Decimal(data.get("amount"))
-    await state.clear()
-
+    tx_number = data.get("tx_number", "").strip()
     method = await sync_to_async(PaymentMethod.objects.filter(id=method_id).first)()
+    if not method or not tx_number:
+        await state.clear()
+        await message.answer("⚠️ انتهت جلسة طلب الشحن. ابدأ الطلب من جديد.", reply_markup=get_customer_main_menu())
+        return
 
+    # Telegram keeps the file on its servers; the largest photo variant gives
+    # the admin the best review quality while storing only a small file_id.
+    proof_image_file_id = message.photo[-1].file_id
     req = await sync_to_async(PaymentService.create_payment_request)(
         user=user_profile,
         payment_method=method,
         amount_yer=amount,
         tx_number=tx_number,
-        proof_image_file_id="",
+        proof_image_file_id=proof_image_file_id,
         proof_image_url=""
     )
+    await state.clear()
 
-    # Post interactive card to Admin Group
     await AdminGroupNotifierService.send_payment_request_card(bot, req)
 
-    m_name = html.escape(method.name) if method else "غير محدد"
+    m_name = html.escape(method.name)
     text = (
         f"✅ <b>تم استلام طلب شحن الرصيد بنجاح!</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -188,18 +210,12 @@ async def handle_deposit_tx_number_received(message: Message, user_profile: Tele
         f"💰 المبلغ: <b>{amount:,.0f} YER</b>\n"
         f"🔢 رقم العملية: <code>{html.escape(tx_number)}</code>\n"
         f"🏦 طريقة الدفع: {m_name}\n"
+        f"📸 تم إرفاق صورة التحويل للمراجعة\n"
         f"⏳ الحالة: <b>قيد المراجعة والاعتماد</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"سيقوم المشرف بمطابقة رقم العملية وإيداع الرصيد في محفظتك خلال دقائق مع إشعارك فوراً."
+        f"سيقوم المشرف بمطابقة البيانات وإيداع الرصيد في محفظتك بعد التحقق."
     )
     await message.answer(text, reply_markup=get_wallet_keyboard(), parse_mode='HTML')
-
-
-@router.message(DepositStates.waiting_for_proof_photo)
-async def handle_deposit_photo_legacy(message: Message, user_profile: TelegramProfile, state: FSMContext, bot):
-    """Legacy state forwarder to waiting_for_tx_number."""
-    await state.set_state(DepositStates.waiting_for_tx_number)
-    await handle_deposit_tx_number_received(message, user_profile, state, bot)
 
 
 @router.callback_query(F.data == "wallet_history")

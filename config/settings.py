@@ -193,13 +193,6 @@ REQUIRED_CHANNEL_TITLE = os.getenv('REQUIRED_CHANNEL_TITLE', 'قناة المت�
 DATA_ENCRYPTION_KEY = os.getenv('DATA_ENCRYPTION_KEY', '')
 
 # ==============================================================================
-# Cloudinary Configuration
-# ==============================================================================
-CLOUDINARY_CLOUD_NAME = os.getenv('CLOUDINARY_CLOUD_NAME', '')
-CLOUDINARY_API_KEY = os.getenv('CLOUDINARY_API_KEY', '')
-CLOUDINARY_API_SECRET = os.getenv('CLOUDINARY_API_SECRET', '')
-
-# ==============================================================================
 # Currency & Pricing Defaults
 # ==============================================================================
 DEFAULT_EXCHANGE_RATE_USD_TO_YER = float(os.getenv('DEFAULT_EXCHANGE_RATE_USD_TO_YER', '550.00'))

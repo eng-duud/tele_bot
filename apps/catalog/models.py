@@ -68,8 +68,8 @@ class Product(TimeStampedModel):
     requires_customer_input = models.BooleanField(_('يتطلب بيانات إضافية من العميل (مثل ID اللاعب أو الإيميل)'), default=False)
     customer_input_label = models.CharField(_('عنوان الحقل المطلوب من العميل'), max_length=150, blank=True)
     
-    image_url = models.URLField(_('رابط الصورة (Cloudinary)'), blank=True)
-    image_public_id = models.CharField(_('معرف Cloudinary للصورة'), max_length=150, blank=True)
+    image_url = models.URLField(_('رابط صورة المنتج'), blank=True)
+    image_public_id = models.CharField(_('معرف الصورة الخارجي'), max_length=150, blank=True)
     
     is_active = models.BooleanField(_('مفعل للبيع'), default=True)
     display_order = models.PositiveIntegerField(_('ترتيب العرض'), default=0)
@@ -84,7 +84,7 @@ class Product(TimeStampedModel):
 
 
 class ProductImage(TimeStampedModel):
-    """Multiple images for a product stored in Cloudinary."""
+    """Multiple product images referenced by URL."""
     product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='gallery_images', verbose_name=_('المنتج'))
     image_url = models.URLField(_('رابط الصورة'))
     public_id = models.CharField(_('معرف الصورة'), max_length=150)
