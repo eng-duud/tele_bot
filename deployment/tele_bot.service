@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram Bots Polling Service (Customer & Admin Bots)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/www/tele_bot
+EnvironmentFile=/var/www/tele_bot/.env
+ExecStart=/var/www/tele_bot/venv/bin/python manage.py run_all_bots
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

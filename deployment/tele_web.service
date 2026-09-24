@@ -1,0 +1,17 @@
+[Unit]
+Description=Gunicorn Web Daemon for Telegram Bot Django Backend
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/www/tele_bot
+EnvironmentFile=/var/www/tele_bot/.env
+ExecStart=/var/www/tele_bot/venv/bin/gunicorn config.wsgi:application --workers 3 --bind 0.0.0.0:8000
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

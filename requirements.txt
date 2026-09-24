@@ -1,0 +1,26 @@
+# Core Framework
+Django>=5.0
+djangorestframework
+gunicorn
+
+# Database & Cache
+psycopg2-binary
+redis
+
+# Background Tasks & Workers
+celery
+
+# Telegram Bot API (aiogram installs compatible aiohttp automatically)
+aiogram
+
+# Security & Encryption
+cryptography
+
+# Cloud Storage
+cloudinary
+
+# Utilities & Config
+python-dotenv
+pydantic
+pillow
+requests
