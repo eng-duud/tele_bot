@@ -44,6 +44,7 @@ from apps.telegram_bot.common.states import (
     AdminCustomerSearchStates,
     AdminManualWalletStates,
     AdminAddChannelStates,
+    AdminChannelConfigStates,
     AdminAddDigitalServiceStates,
     AdminProvideQuoteStates,
     AdminMapProductApiStates,
@@ -2142,54 +2143,14 @@ async def handle_toggle_base_currency(callback: CallbackQuery):
 @router.callback_query(F.data == "adm_success_ch_view")
 async def handle_success_channel_view(callback: CallbackQuery):
     """View and manage success/activations channel settings."""
-    await callback.answer()
-    ch_id = await sync_to_async(SystemSettingService.get_setting)('SUCCESS_CHANNEL_ID', '')
-    ch_title = await sync_to_async(SystemSettingService.get_setting)('SUCCESS_CHANNEL_TITLE', 'قناة التفعيلات')
-    ch_url = await sync_to_async(SystemSettingService.get_setting)('SUCCESS_CHANNEL_URL', '')
-    is_enabled = await sync_to_async(SystemSettingService.get_bool)('SUCCESS_CHANNEL_ENABLED', False)
-
-    status_text = "🟢 مفعّل (يتم النشر تلقائياً)" if is_enabled else "🔴 معطّل (النشر متوقف)"
-
-    text = (
-        f"📢 <b>إعدادات قناة التفعيلات الناجحة (Success Channel)</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🆔 <b>معرف القناة:</b> <code>{html.escape(ch_id or 'غير محدد')}</code>\n"
-        f"🏷️ <b>اسم القناة:</b> <b>{html.escape(ch_title)}</b>\n"
-        f"🔗 <b>رابط القناة:</b> <code>{html.escape(ch_url or 'لا يوجد')}</code>\n"
-        f"⚡ <b>حالة النشر:</b> <b>{status_text}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"<i>ملاحظة: تأكد من إضافة بوت المتجر كمشرف في القناة ولديه صلاحية نشر الرسائل.</i>"
-    )
-
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text=f"🔄 {'تعطيل' if is_enabled else 'تفعيل'} النشر التلقائي", callback_data="adm_toggle_success_ch"),
-        ],
-        [
-            InlineKeyboardButton(text="🆔 تعديل معرف القناة (ID/@)", callback_data="adm_edit_success_ch_id"),
-            InlineKeyboardButton(text="🏷️ تعديل اسم القناة", callback_data="adm_edit_success_ch_title"),
-        ],
-        [
-            InlineKeyboardButton(text="🔗 تعديل رابط القناة", callback_data="adm_edit_success_ch_url"),
-            InlineKeyboardButton(text="🧪 فحص إرسال تجريبي", callback_data="adm_test_success_ch"),
-        ],
-        [
-            InlineKeyboardButton(text="⚙️ العودة للإعدادات", callback_data="adm_settings_view"),
-            InlineKeyboardButton(text="🏠 الرئيسية", callback_data="adm_home"),
-        ]
-    ])
-
-    await callback.message.edit_text(text, reply_markup=markup, parse_mode='HTML')
+    callback.data = "adm_slot_view:SUCCESS"
+    await handle_slot_view(callback)
 
 
 @router.callback_query(F.data == "adm_toggle_success_ch")
 async def handle_toggle_success_channel(callback: CallbackQuery):
     """Toggle success channel broadcasting."""
-    current = await sync_to_async(SystemSettingService.get_bool)('SUCCESS_CHANNEL_ENABLED', True)
-    new_state = "false" if current else "true"
-    await sync_to_async(SystemSettingService.set_setting)('SUCCESS_CHANNEL_ENABLED', new_state, "تفعيل/تعطيل النشر في قناة التفعيلات")
-    await callback.answer(f"تم {'تعطيل' if current else 'تفعيل'} النشر التلقائي بنجاح!")
-    await handle_success_channel_view(callback)
+    await handle_slot_toggle_publish(callback)
 
 
 @router.callback_query(F.data == "adm_edit_success_ch_id")
@@ -2584,106 +2545,408 @@ async def handle_save_new_ref_bonus(message: Message, state: FSMContext):
 
 
 # ==============================================================================
-# 9. إدارة القنوات الإجبارية (Mandatory Channels Manager)
+# 9. إدارة قنوات ومجموعات النظام (SaaS Channels & Support Manager)
 # ==============================================================================
+
+SLOT_METADATA = {
+    'OFFICIAL': {
+        'name': 'قناة البوت الرسمية',
+        'icon': '📢',
+        'desc': 'القناة العامة الأساسية للمتجر (تظهر للعملاء للاشتراك الإجباري والتحديثات)',
+        'setting_id': 'OFFICIAL_CHANNEL_ID',
+        'setting_title': 'OFFICIAL_CHANNEL_TITLE',
+        'setting_url': 'OFFICIAL_CHANNEL_URL',
+        'setting_mand': 'OFFICIAL_CHANNEL_MANDATORY',
+        'has_mand': True,
+        'has_publish': False,
+    },
+    'SUCCESS': {
+        'name': 'قناة التفعيلات والمبيعات',
+        'icon': '⚡',
+        'desc': 'قناة نشر عمليات الشراء والتسليم الناجحة تلقائياً لتعزيز الموثوقية',
+        'setting_id': 'SUCCESS_CHANNEL_ID',
+        'setting_title': 'SUCCESS_CHANNEL_TITLE',
+        'setting_url': 'SUCCESS_CHANNEL_URL',
+        'setting_mand': 'SUCCESS_CHANNEL_MANDATORY',
+        'has_mand': True,
+        'has_publish': True,
+    },
+    'SUPPORT': {
+        'name': 'قناة / قروب الدعم الفني',
+        'icon': '🎧',
+        'desc': 'مجموعة أو قناة استقبال تذاكر ورسائل العملاء، والرد عليها يصل للعميل مباشرة',
+        'setting_id': 'SUPPORT_CHANNEL_ID',
+        'setting_title': 'SUPPORT_CHANNEL_TITLE',
+        'setting_url': '',
+        'setting_mand': '',
+        'has_mand': False,
+        'has_publish': False,
+    },
+    'ADMIN': {
+        'name': 'قروب / قناة إشعارات الإدارة',
+        'icon': '🛡️',
+        'desc': 'مجموعة المشرفين الخاصة لاستلام طلبات الشحن، تنبيهات الأرصدة، والمشاكل التقنية',
+        'setting_id': 'ADMIN_CHANNEL_ID',
+        'setting_title': 'ADMIN_CHANNEL_TITLE',
+        'setting_url': '',
+        'setting_mand': '',
+        'has_mand': False,
+        'has_publish': False,
+    },
+}
+
+
 @router.callback_query(F.data == "adm_channels_list")
 @router.message(F.text == "📢 القنوات الإجبارية")
 async def handle_channels_list(event: Message | CallbackQuery):
-    """View and manage dynamic SaaS system channels (Subscription, Success, Backup, Alerts)."""
+    """Main dashboard displaying pre-configured 4 system channel slots plus custom channels."""
     if isinstance(event, CallbackQuery):
         await event.answer()
         target = event.message
     else:
         target = event
 
-    channels = await sync_to_async(list)(RequiredChannel.objects.all())
-    mand_sub_enabled = await sync_to_async(SystemSettingService.get_bool)('MANDATORY_SUBSCRIPTION_ENABLED', False)
-    global_status = "🟢 مفعّل (الاشتراك إجباري)" if mand_sub_enabled else "⚪ اختياري (الدخول متاح للجميع)"
+    # Fetch settings for the 4 slots
+    official_id = await sync_to_async(SystemSettingService.get_setting)('OFFICIAL_CHANNEL_ID', '') or getattr(settings, 'REQUIRED_CHANNEL_ID', '')
+    official_title = await sync_to_async(SystemSettingService.get_setting)('OFFICIAL_CHANNEL_TITLE', 'قناة البوت الرسمية')
+    official_mand = await sync_to_async(SystemSettingService.get_bool)('OFFICIAL_CHANNEL_MANDATORY', True)
 
-    buttons = []
-    text_lines = [
-        "📢 <b>مدير قنوات النظام والمتجر (SaaS Channels Manager)</b>\n"
-        f"⚡ <b>الاشتراك الإجباري:</b> <b>{global_status}</b>\n"
-        "━━━━━━━━━━━━━━━━━━"
-    ]
+    success_id = await sync_to_async(SystemSettingService.get_setting)('SUCCESS_CHANNEL_ID', '') or getattr(settings, 'SUCCESS_CHANNEL_ID', '')
+    success_title = await sync_to_async(SystemSettingService.get_setting)('SUCCESS_CHANNEL_TITLE', 'قناة التفعيلات المباشرة')
+    success_enabled = await sync_to_async(SystemSettingService.get_bool)('SUCCESS_CHANNEL_ENABLED', True)
+    success_mand = await sync_to_async(SystemSettingService.get_bool)('SUCCESS_CHANNEL_MANDATORY', True)
 
-    type_icons = {
-        'SUBSCRIPTION': '🔒 اشتراك إجباري للعملاء',
-        'SUCCESS': '📢 نشر التفعيلات الناجحة',
-        'BACKUP': '📦 نسخ احتياطي للبيانات',
-        'ALERTS': '🔔 إشعارات الإدارة والمشرفين',
-    }
+    support_id = await sync_to_async(SystemSettingService.get_setting)('SUPPORT_CHANNEL_ID', '') or getattr(settings, 'SUPPORT_CHANNEL_ID', '')
+    support_title = await sync_to_async(SystemSettingService.get_setting)('SUPPORT_CHANNEL_TITLE', 'قناة/قروب الدعم الفني')
 
-    if not channels:
-        text_lines.append("<i>لا توجد أي قنوات مضافة حالياً. يمكنك إضافة قنوات وتحديد دور كل قناة.</i>")
-    else:
-        for idx, ch in enumerate(channels, 1):
-            role_label = type_icons.get(ch.channel_type, ch.channel_type)
-            status_dot = "🟢" if ch.is_active else "🔴"
-            title_escaped = html.escape(str(ch.channel_title))
-            id_escaped = html.escape(str(ch.channel_id))
-            
-            text_lines.append(
-                f"{idx}. {status_dot} <b>{title_escaped}</b>\n"
-                f"   📌 <b>الدور:</b> {role_label}\n"
-                f"   🆔 <b>المعرف:</b> <code>{id_escaped}</code>"
-            )
-            buttons.append([
-                InlineKeyboardButton(text=f"🧪 فحص جاهزية: {ch.channel_title[:15]}", callback_data=f"adm_ch_test:{ch.id}"),
-                InlineKeyboardButton(text="🗑️ حذف", callback_data=f"adm_ch_del:{ch.id}")
-            ])
+    admin_id = await sync_to_async(SystemSettingService.get_setting)('ADMIN_CHANNEL_ID', '') or getattr(settings, 'ADMIN_GROUP_ID', '')
+    admin_title = await sync_to_async(SystemSettingService.get_setting)('ADMIN_CHANNEL_TITLE', 'قروب إشعارات الإدارة')
 
-    text_lines.append("━━━━━━━━━━━━━━━━━━\nاختر قناة لفحص صلاحيات البوت فيها أو أضف قناة جديدة:")
-    
-    buttons.append([InlineKeyboardButton(text="➕ إضافة قناة وضبط دورها في النظام", callback_data="adm_ch_add")])
-    buttons.append([
-        InlineKeyboardButton(
-            text=f"🔄 {'تعطيل' if mand_sub_enabled else 'تفعيل'} نظام الاشتراك الإجباري",
-            callback_data="adm_toggle_mand_sub"
-        )
-    ])
-    buttons.append([
-        InlineKeyboardButton(text="⚙️ العودة للإعدادات", callback_data="adm_settings_view"),
-        InlineKeyboardButton(text="🏠 عودة للرئيسية", callback_data="adm_home")
-    ])
+    mand_sub_enabled = await sync_to_async(SystemSettingService.get_bool)('MANDATORY_SUBSCRIPTION_ENABLED', True)
+    global_status = "🟢 مفعّل" if mand_sub_enabled else "⚪ معطّل"
 
-    markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-    if isinstance(event, CallbackQuery):
-        await target.edit_text("\n".join(text_lines), reply_markup=markup, parse_mode='HTML')
-    else:
-        await target.answer("\n".join(text_lines), reply_markup=markup, parse_mode='HTML')
+    custom_channels = await sync_to_async(list)(
+        RequiredChannel.objects.filter(channel_type__in=['CUSTOM', 'SUBSCRIPTION'])
+    )
 
+    off_status = f"🔒 إجباري ({'🟢' if official_mand else '⚪'})" if official_id else "⚪ غير مهيأة"
+    suc_pub = f"نشر: {'🟢' if success_enabled else '🔴'}"
+    suc_mand = f"إجباري: {'🟢' if success_mand else '⚪'}"
+    suc_status = f"({suc_pub} | {suc_mand})" if success_id else "⚪ غير مهيأة"
+    sup_status = "🟢 جاهزة لاستقبال التذاكر" if support_id else "⚪ غير مهيأة (تعمل بالتذاكر العادية)"
+    adm_status = "🟢 متصل لاستلام التنبيهات" if admin_id else "⚪ غير مهيأ"
 
-@router.callback_query(F.data.startswith("adm_ch_test:"))
-async def handle_channel_audit_test(callback: CallbackQuery):
-    """Perform real-time Telegram API permission and readiness audit on a specific channel."""
-    await callback.answer("⏳ جاري الاتصال بتيليجرام وفحص صلاحيات البوت في القناة...")
-    ch_id = callback.data.split(":")[1]
-    
-    ch = await sync_to_async(RequiredChannel.objects.filter(id=ch_id).first)()
-    if not ch:
-        await callback.message.answer("⚠️ لم يتم العثور على القناة المحددة.")
-        return
+    text = (
+        f"📡 <b>مدير قنوات ومجموعات النظام (SaaS Channels)</b>\n"
+        f"⚡ <b>حالة الاشتراك الإجباري العام:</b> <b>{global_status}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"1️⃣ 📢 <b>قناة البوت الرسمية:</b>\n"
+        f"   🆔 <code>{html.escape(official_id or 'لم يتم التحديد بعد')}</code>\n"
+        f"   🏷️ {html.escape(official_title)} | {off_status}\n\n"
+        f"2️⃣ ⚡ <b>قناة التفعيلات والمبيعات:</b>\n"
+        f"   🆔 <code>{html.escape(success_id or 'لم يتم التحديد بعد')}</code>\n"
+        f"   🏷️ {html.escape(success_title)} | {suc_status}\n\n"
+        f"3️⃣ 🎧 <b>قناة / قروب الدعم الفني:</b>\n"
+        f"   🆔 <code>{html.escape(support_id or 'لم يتم التحديد بعد')}</code>\n"
+        f"   🏷️ {html.escape(support_title)} | {sup_status}\n\n"
+        f"4️⃣ 🛡️ <b>قروب / قناة إشعارات الإدارة:</b>\n"
+        f"   🆔 <code>{html.escape(admin_id or 'لم يتم التحديد بعد')}</code>\n"
+        f"   🏷️ {html.escape(admin_title)} | {adm_status}\n"
+    )
 
-    report = await ChannelAuditService.audit_channel(
-        bot=callback.bot,
-        channel_id=ch.channel_id,
-        channel_type=ch.channel_type
+    if custom_channels:
+        text += f"━━━━━━━━━━━━━━━━━━\n➕ <b>قنوات اشتراك إجباري إضافية ({len(custom_channels)}):</b>\n"
+        for idx, ch in enumerate(custom_channels, 1):
+            text += f"{idx}. <b>{html.escape(ch.channel_title)}</b> (<code>{html.escape(ch.channel_id)}</code>)\n"
+
+    text += (
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💡 <i>اختر القناة المراد إعدادها أو تعديل رابطها وصلاحياتها:</i>"
     )
 
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 إعادة الفحص الآن", callback_data=f"adm_ch_test:{ch.id}")],
-        [InlineKeyboardButton(text="📢 العودة لقائمة القنوات", callback_data="adm_channels_list")],
+        [
+            InlineKeyboardButton(text="📢 ضبط قناة البوت", callback_data="adm_slot_view:OFFICIAL"),
+            InlineKeyboardButton(text="⚡ ضبط قناة التفعيلات", callback_data="adm_slot_view:SUCCESS"),
+        ],
+        [
+            InlineKeyboardButton(text="🎧 ضبط قناة الدعم", callback_data="adm_slot_view:SUPPORT"),
+            InlineKeyboardButton(text="🛡️ ضبط قروب الإدارة", callback_data="adm_slot_view:ADMIN"),
+        ],
+        [
+            InlineKeyboardButton(text="➕ إضافة قناة اشتراك إضافية", callback_data="adm_ch_add"),
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"🔄 {'تعطيل' if mand_sub_enabled else 'تفعيل'} الاشتراك الإجباري العام",
+                callback_data="adm_toggle_mand_sub"
+            )
+        ],
+        [
+            InlineKeyboardButton(text="⚙️ العودة للإعدادات", callback_data="adm_settings_view"),
+            InlineKeyboardButton(text="🏠 الرئيسية", callback_data="adm_home")
+        ]
+    ])
+
+    if isinstance(event, CallbackQuery):
+        await target.edit_text(text, reply_markup=markup, parse_mode='HTML')
+    else:
+        await target.answer(text, reply_markup=markup, parse_mode='HTML')
+
+
+@router.callback_query(F.data.startswith("adm_slot_view:"))
+async def handle_slot_view(callback: CallbackQuery):
+    """View details and management actions for a specific channel slot."""
+    await callback.answer()
+    slot_key = callback.data.split(":")[1]
+    meta = SLOT_METADATA.get(slot_key)
+    if not meta:
+        await callback.message.answer("⚠️ دور القناة غير معروف.")
+        return
+
+    cid = await sync_to_async(SystemSettingService.get_setting)(meta['setting_id'], '')
+    ctitle = await sync_to_async(SystemSettingService.get_setting)(meta['setting_title'], meta['name'])
+    curl = await sync_to_async(SystemSettingService.get_setting)(meta.get('setting_url', ''), '') if meta.get('setting_url') else ''
+
+    extra_info = []
+    if meta['has_mand']:
+        mand_val = await sync_to_async(SystemSettingService.get_bool)(meta['setting_mand'], True)
+        extra_info.append(f"🔒 <b>الاشتراك الإجباري للعملاء:</b> {'🟢 مفعّل' if mand_val else '⚪ معطّل'}")
+
+    if meta['has_publish']:
+        pub_val = await sync_to_async(SystemSettingService.get_bool)('SUCCESS_CHANNEL_ENABLED', True)
+        extra_info.append(f"⚡ <b>النشر التلقائي للعمليات:</b> {'🟢 مفعّل' if pub_val else '🔴 معطّل'}")
+
+    extra_str = ("\n" + "\n".join(extra_info)) if extra_info else ""
+
+    text = (
+        f"{meta['icon']} <b>إعدادات {meta['name']}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📝 <b>الوصف:</b> {meta['desc']}\n\n"
+        f"🆔 <b>المعرف أو الآيدي:</b> <code>{html.escape(cid or 'غير محدد بعد')}</code>\n"
+        f"🏷️ <b>الاسم المسجل:</b> <b>{html.escape(ctitle)}</b>\n"
+        f"🔗 <b>الرابط:</b> <code>{html.escape(curl or 'لا يوجد')}</code>"
+        f"{extra_str}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💡 <i>لربط القناة: تأكد من رفع البوت مشرفاً فيها أولاً ثم اضغط [تعيين/تغيير القناة]</i>"
+    )
+
+    buttons = [
+        [InlineKeyboardButton(text="✏️ تعيين / تغيير القناة", callback_data=f"adm_slot_edit:{slot_key}")]
+    ]
+
+    toggle_row = []
+    if meta['has_mand']:
+        mand_val = await sync_to_async(SystemSettingService.get_bool)(meta['setting_mand'], True)
+        toggle_row.append(
+            InlineKeyboardButton(
+                text=f"🔄 {'تعطيل' if mand_val else 'تفعيل'} الإجباري",
+                callback_data=f"adm_slot_toggle_mand:{slot_key}"
+            )
+        )
+    if meta['has_publish']:
+        pub_val = await sync_to_async(SystemSettingService.get_bool)('SUCCESS_CHANNEL_ENABLED', True)
+        toggle_row.append(
+            InlineKeyboardButton(
+                text=f"🔄 {'تعطيل' if pub_val else 'تفعيل'} النشر",
+                callback_data="adm_slot_toggle_publish:SUCCESS"
+            )
+        )
+    if toggle_row:
+        buttons.append(toggle_row)
+
+    buttons.append([InlineKeyboardButton(text="🧪 فحص الصلاحيات وإرسال تجربة", callback_data=f"adm_slot_test:{slot_key}")])
+    buttons.append([InlineKeyboardButton(text="🔙 العودة لمدير القنوات", callback_data="adm_channels_list")])
+
+    markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode='HTML')
+
+
+@router.callback_query(F.data.startswith("adm_slot_edit:"))
+async def handle_slot_edit_prompt(callback: CallbackQuery, state: FSMContext):
+    """Prompt admin to enter new channel ID, URL, or username for a specific slot."""
+    await callback.answer()
+    slot_key = callback.data.split(":")[1]
+    meta = SLOT_METADATA.get(slot_key)
+    if not meta:
+        return
+
+    await state.update_data(slot_key=slot_key)
+    await state.set_state(AdminChannelConfigStates.waiting_for_channel_input)
+
+    prompt = (
+        f"{meta['icon']} <b>تهيئة {meta['name']}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"أرسل الآن <b>معرف القناة أو الآيدي أو رابطها</b>:\n"
+        f"• مثال بمعرف: <code>@MyChannel</code>\n"
+        f"• مثال بآيدي رقمي: <code>-1001234567890</code>\n"
+        f"• مثال برابط: <code>https://t.me/MyChannel</code>\n\n"
+        f"💡 <b>ملاحظة هامة:</b> تأكد من رفع البوت مشرفاً (Admin) في القناة/المجموعة أولاً لكي يستطيع العمل وفحص الصلاحيات.\n"
+        f"<i>(أرسل 'إلغاء' للتراجع)</i>"
+    )
+    await callback.message.answer(prompt, parse_mode='HTML')
+
+
+@router.message(AdminChannelConfigStates.waiting_for_channel_input)
+async def handle_slot_input_received(message: Message, state: FSMContext):
+    """Receive channel ID/URL, auto-discover title via Telegram API, and save."""
+    txt = (message.text or "").strip()
+    if txt.lower() in ("/cancel", "إلغاء", "الغاء", "رجوع"):
+        await state.clear()
+        await message.answer("❌ تم إلغاء التعديل.")
+        return
+
+    data = await state.get_data()
+    slot_key = data.get("slot_key", "OFFICIAL")
+    meta = SLOT_METADATA.get(slot_key, SLOT_METADATA['OFFICIAL'])
+    await state.clear()
+
+    cid = ChannelAuditService.clean_identifier(txt)
+    str_cid = str(cid)
+
+    # Auto-discover chat metadata via Telegram Bot API
+    auto_title = meta['name']
+    auto_invite = ""
+    try:
+        chat = await message.bot.get_chat(chat_id=cid)
+        if chat:
+            if chat.title:
+                auto_title = chat.title
+            if chat.username:
+                auto_invite = f"https://t.me/{chat.username}"
+            elif chat.invite_link:
+                auto_invite = chat.invite_link
+    except Exception as api_err:
+        logger.warning(f"Could not auto-fetch chat info for {cid}: {api_err}")
+
+    # Persist in SystemSettingService
+    await sync_to_async(SystemSettingService.set_setting)(meta['setting_id'], str_cid, meta['name'])
+    await sync_to_async(SystemSettingService.set_setting)(meta['setting_title'], auto_title, f"اسم {meta['name']}")
+    if meta.get('setting_url') and auto_invite:
+        await sync_to_async(SystemSettingService.set_setting)(meta['setting_url'], auto_invite, f"رابط {meta['name']}")
+
+    # Persist in RequiredChannel model
+    def _save_db():
+        is_mand = True if slot_key in ('OFFICIAL', 'SUCCESS') else False
+        RequiredChannel.objects.update_or_create(
+            channel_type=slot_key,
+            defaults={
+                'channel_id': str_cid,
+                'channel_title': auto_title,
+                'invite_link': auto_invite,
+                'is_mandatory': is_mand,
+                'is_active': True
+            }
+        )
+    await sync_to_async(_save_db)()
+    ChannelSubscriptionService.clear_cache()
+
+    # Perform immediate audit
+    audit = await ChannelAuditService.audit_channel(
+        bot=message.bot,
+        channel_id=str_cid,
+        channel_type=slot_key
+    )
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"⚙️ عرض {meta['name']}", callback_data=f"adm_slot_view:{slot_key}")],
+        [InlineKeyboardButton(text="📡 العودة لمدير القنوات", callback_data="adm_channels_list")],
         [InlineKeyboardButton(text="🏠 الرئيسية", callback_data="adm_home")]
     ])
 
-    await callback.message.answer(report['report_text'], reply_markup=markup, parse_mode='HTML')
+    await message.answer(
+        f"✅ <b>تم ربط {meta['name']} بنجاح!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🏷️ <b>الاسم:</b> <b>{html.escape(auto_title)}</b>\n"
+        f"🆔 <b>المعرف:</b> <code>{html.escape(str_cid)}</code>\n\n"
+        f"{audit['report_text']}",
+        reply_markup=markup,
+        parse_mode='HTML'
+    )
+
+
+@router.callback_query(F.data.startswith("adm_slot_toggle_mand:"))
+async def handle_slot_toggle_mand(callback: CallbackQuery):
+    """Toggle mandatory subscription flag for Official or Success channel."""
+    slot_key = callback.data.split(":")[1]
+    meta = SLOT_METADATA.get(slot_key)
+    if not meta or not meta.get('setting_mand'):
+        return
+
+    current = await sync_to_async(SystemSettingService.get_bool)(meta['setting_mand'], True)
+    new_val = "false" if current else "true"
+    await sync_to_async(SystemSettingService.set_setting)(meta['setting_mand'], new_val, f"إجبارية اشتراك {meta['name']}")
+
+    def _update_db():
+        RequiredChannel.objects.filter(channel_type=slot_key).update(is_mandatory=(new_val == 'true'))
+    await sync_to_async(_update_db)()
+    ChannelSubscriptionService.clear_cache()
+
+    label = "معطّل (اختياري)" if current else "مفعّل (إجباري)"
+    await callback.answer(f"تم تعديل الاشتراك في {meta['name']} إلى: {label}", show_alert=True)
+    await handle_slot_view(callback)
+
+
+@router.callback_query(F.data == "adm_slot_toggle_publish:SUCCESS")
+async def handle_slot_toggle_publish(callback: CallbackQuery):
+    """Toggle automated success channel publishing."""
+    current = await sync_to_async(SystemSettingService.get_bool)('SUCCESS_CHANNEL_ENABLED', True)
+    new_val = "false" if current else "true"
+    await sync_to_async(SystemSettingService.set_setting)('SUCCESS_CHANNEL_ENABLED', new_val, "نشر عمليات الشراء في قناة التفعيلات")
+    await callback.answer(f"تم {'تعطيل' if current else 'تفعيل'} النشر التلقائي في قناة التفعيلات!")
+    await handle_slot_view(callback)
+
+
+@router.callback_query(F.data.startswith("adm_slot_test:"))
+async def handle_slot_test(callback: CallbackQuery):
+    """Perform live permission check and dispatch test message to channel."""
+    await callback.answer("⏳ جاري فحص صلاحيات البوت في القناة...")
+    slot_key = callback.data.split(":")[1]
+    meta = SLOT_METADATA.get(slot_key)
+    if not meta:
+        return
+
+    cid = await sync_to_async(SystemSettingService.get_setting)(meta['setting_id'], '')
+    if not cid:
+        await callback.message.answer(f"⚠️ لم يتم تحديد معرف {meta['name']} بعد! يرجى تعيينها أولاً.")
+        return
+
+    bot = callback.bot
+    audit = await ChannelAuditService.audit_channel(bot=bot, channel_id=cid, channel_type=slot_key)
+
+    test_post_status = ""
+    clean_target = ChannelAuditService.clean_identifier(cid)
+    try:
+        sent = await bot.send_message(
+            chat_id=clean_target,
+            text=(
+                f"🧪 <b>رسالة فحص تجريبية من لوحة الإدارة</b> ✅\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"تم التحقق بنجاح من ربط <b>{meta['name']}</b> بالبوت وأن الصلاحيات تعمل بكفاءة."
+            ),
+            parse_mode='HTML'
+        )
+        test_post_status = f"\n\n🚀 <b>نتيجة الإرسال التجريبي:</b> نجح الإرسال بنجاح (معرف الرسالة: <code>{sent.message_id}</code>) ✅"
+    except Exception as send_err:
+        test_post_status = f"\n\n⚠️ <b>تعذر إرسال رسالة تجريبية:</b> <code>{html.escape(str(send_err))}</code>\n(تأكد من منح البوت صلاحية إرسال الرسائل)."
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 إعادة الفحص", callback_data=f"adm_slot_test:{slot_key}")],
+        [InlineKeyboardButton(text=f"⚙️ العودة لـ {meta['name']}", callback_data=f"adm_slot_view:{slot_key}")],
+        [InlineKeyboardButton(text="📡 مدير القنوات", callback_data="adm_channels_list")]
+    ])
+
+    await callback.message.answer(
+        f"{audit['report_text']}{test_post_status}",
+        reply_markup=markup,
+        parse_mode='HTML'
+    )
 
 
 @router.callback_query(F.data == "adm_toggle_mand_sub")
 async def handle_toggle_mandatory_sub(callback: CallbackQuery):
-    """Toggle mandatory channel subscription on/off globally."""
-    current = await sync_to_async(SystemSettingService.get_bool)('MANDATORY_SUBSCRIPTION_ENABLED', False)
+    """Toggle mandatory channel subscription globally."""
+    current = await sync_to_async(SystemSettingService.get_bool)('MANDATORY_SUBSCRIPTION_ENABLED', True)
     new_state = "false" if current else "true"
     await sync_to_async(SystemSettingService.set_setting)('MANDATORY_SUBSCRIPTION_ENABLED', new_state, "تفعيل أو تعطيل نظام الاشتراك الإجباري")
     ChannelSubscriptionService.clear_cache()
@@ -2693,6 +2956,7 @@ async def handle_toggle_mandatory_sub(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("adm_ch_del:"))
 async def handle_channel_del(callback: CallbackQuery):
+    """Delete custom mandatory channel."""
     await callback.answer()
     ch_id = callback.data.split(":")[1]
 
@@ -2713,14 +2977,14 @@ async def handle_channel_del(callback: CallbackQuery):
 
 @router.callback_query(F.data == "adm_ch_add")
 async def handle_channel_add_prompt(callback: CallbackQuery, state: FSMContext):
-    """Start channel addition wizard."""
+    """Wizard to add an additional custom mandatory channel."""
     await callback.answer()
     await state.set_state(AdminAddChannelStates.waiting_for_channel_id)
     await callback.message.answer(
-        "📢 <b>إضافة قناة جديدة للنظام (الخطوة 1/3)</b>\n"
+        "📢 <b>إضافة قناة اشتراك إجباري إضافية (الخطوة 1/2)</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "أرسل <b>معرف القناة</b> (مثال: <code>@MyChannel</code> أو الآيدي <code>-1001234567890</code> أو رابط القناة):\n\n"
-        "💡 <i>نصيحة: تأكد من إضافة بوت المتجر كمشرف في القناة أولاً لتفعيل الصلاحيات.</i>\n"
+        "أرسل <b>معرف القناة</b> (مثال: <code>@MySponsorChannel</code> أو الآيدي <code>-1001234567890</code> أو الرابط):\n\n"
+        "💡 <i>تأكد من إضافة البوت كمشرف في القناة أولاً لتفعيل الصلاحيات.</i>\n"
         "<i>(أرسل /cancel للإلغاء)</i>",
         parse_mode='HTML'
     )
@@ -2737,37 +3001,31 @@ async def handle_channel_id_entered(message: Message, state: FSMContext):
     cid = ChannelAuditService.clean_identifier(txt)
     await state.update_data(ch_id=str(cid))
 
-    # Auto-discover chat title via Telegram Bot API
     auto_title = None
+    auto_invite = ""
     try:
         chat = await message.bot.get_chat(chat_id=cid)
-        if chat and chat.title:
-            auto_title = chat.title
+        if chat:
+            if chat.title:
+                auto_title = chat.title
+            if chat.username:
+                auto_invite = f"https://t.me/{chat.username}"
+            elif chat.invite_link:
+                auto_invite = chat.invite_link
     except Exception:
         pass
 
     if auto_title:
-        await state.update_data(ch_title=auto_title)
-        await state.set_state(AdminAddChannelStates.waiting_for_type)
-        
-        type_markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔒 اشتراك إجباري للعملاء", callback_data="ch_type:SUBSCRIPTION")],
-            [InlineKeyboardButton(text="📢 نشر التفعيلات والعمليات", callback_data="ch_type:SUCCESS")],
-            [InlineKeyboardButton(text="📦 نسخ احتياطي للبيانات", callback_data="ch_type:BACKUP")],
-            [InlineKeyboardButton(text="🔔 إشعارات الإدارة والمشرفين", callback_data="ch_type:ALERTS")],
-        ])
+        await state.update_data(ch_title=auto_title, ch_link=auto_invite)
+        await state.set_state(AdminAddChannelStates.waiting_for_invite_link)
         await message.answer(
             f"✅ تم التعرف على القناة: <b>{html.escape(auto_title)}</b>\n\n"
-            f"🎯 <b>الخطوة 2/3: اختر دور هذه القناة في النظام:</b>",
-            reply_markup=type_markup,
+            f"🔗 <b>الخطوة 2/2: أرسل رابط الدعوة للقناة</b> (أو أرسل 'تخطي' للاعتماد على الرابط التلقائي <code>{auto_invite or 'لا يوجد'}</code>):",
             parse_mode='HTML'
         )
     else:
         await state.set_state(AdminAddChannelStates.waiting_for_title)
-        await message.answer(
-            "🏷️ <b>الخطوة 2/3: اكتب اسم أو عنوان القناة</b> (مثال: قناة المتجر الرسمية):",
-            parse_mode='HTML'
-        )
+        await message.answer("🏷️ <b>الخطوة 2/2: اكتب اسم أو عنوان القناة</b> (مثال: قناة الراعي الرسمي):", parse_mode='HTML')
 
 
 @router.message(AdminAddChannelStates.waiting_for_title)
@@ -2779,40 +3037,11 @@ async def handle_channel_title_entered(message: Message, state: FSMContext):
         return
 
     await state.update_data(ch_title=title)
-    await state.set_state(AdminAddChannelStates.waiting_for_type)
-
-    type_markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔒 اشتراك إجباري للعملاء", callback_data="ch_type:SUBSCRIPTION")],
-        [InlineKeyboardButton(text="📢 نشر التفعيلات والعمليات", callback_data="ch_type:SUCCESS")],
-        [InlineKeyboardButton(text="📦 نسخ احتياطي للبيانات", callback_data="ch_type:BACKUP")],
-        [InlineKeyboardButton(text="🔔 إشعارات الإدارة والمشرفين", callback_data="ch_type:ALERTS")],
-    ])
+    await state.set_state(AdminAddChannelStates.waiting_for_invite_link)
     await message.answer(
-        f"🎯 <b>اختر دور ووظيفة هذه القناة في النظام:</b>",
-        reply_markup=type_markup,
+        "🔗 <b>أرسل رابط الدعوة للقناة</b> (مثال: <code>https://t.me/channel</code> أو أرسل 'تخطي'):",
         parse_mode='HTML'
     )
-
-
-@router.callback_query(F.data.startswith("ch_type:"))
-async def handle_channel_type_selected(callback: CallbackQuery, state: FSMContext):
-    """Handle channel type selection."""
-    await callback.answer()
-    ch_type = callback.data.split(":")[1]
-    await state.update_data(ch_type=ch_type)
-
-    if ch_type == 'SUBSCRIPTION':
-        await state.set_state(AdminAddChannelStates.waiting_for_invite_link)
-        await callback.message.answer(
-            "🔗 <b>الخطوة 3/3: أرسل رابط الدعوة للقناة</b> (مثال: <code>https://t.me/your_channel</code>):\n"
-            "<i>(أو أرسل 'تخطي' إذا كانت القناة عامة بمعرفها)</i>",
-            parse_mode='HTML'
-        )
-    else:
-        # For Success/Backup/Alerts, link is optional
-        data = await state.get_data()
-        await state.clear()
-        await _finalize_channel_creation(callback.message, callback.bot, data, invite_link="")
 
 
 @router.message(AdminAddChannelStates.waiting_for_invite_link)
@@ -2823,61 +3052,41 @@ async def handle_channel_link_entered(message: Message, state: FSMContext):
         await message.answer("❌ تم الإلغاء.")
         return
 
-    if link in ("تخطي", "skip", "-", "لا يوجد"):
-        link = ""
-
     data = await state.get_data()
     await state.clear()
-    await _finalize_channel_creation(message, message.bot, data, invite_link=link)
+    existing_link = data.get("ch_link", "")
+    final_link = existing_link if link in ("تخطي", "skip", "-", "لا يوجد") else link
 
-
-async def _finalize_channel_creation(target_msg: Message, bot, data: dict, invite_link: str):
-    """Save channel and immediately run diagnostic audit."""
-    title = data.get("ch_title", "قناة بدون اسم")
     ch_id = data.get("ch_id")
-    ch_type = data.get("ch_type", "SUBSCRIPTION")
+    title = data.get("ch_title", "قناة بدون اسم")
 
-    def _create_or_update():
-        obj, created = RequiredChannel.objects.update_or_create(
+    def _create_custom():
+        return RequiredChannel.objects.create(
             channel_id=ch_id,
-            defaults={
-                'channel_title': title,
-                'channel_type': ch_type,
-                'invite_link': invite_link,
-                'is_mandatory': True if ch_type == 'SUBSCRIPTION' else False,
-                'is_active': True
-            }
+            channel_title=title,
+            channel_type='CUSTOM',
+            invite_link=final_link,
+            is_mandatory=True,
+            is_active=True
         )
-        return obj
 
-    ch = await sync_to_async(_create_or_update)()
+    ch = await sync_to_async(_create_custom)()
     ChannelSubscriptionService.clear_cache()
 
-    # Sync corresponding SystemSettings
-    if ch_type == 'SUCCESS':
-        await sync_to_async(SystemSettingService.set_setting)('SUCCESS_CHANNEL_ID', str(ch_id), "قناة التفعيلات المعتمدة")
-        await sync_to_async(SystemSettingService.set_setting)('SUCCESS_CHANNEL_ENABLED', 'true', "تفعيل نشر التفعيلات")
-    elif ch_type == 'BACKUP':
-        await sync_to_async(SystemSettingService.set_setting)('BACKUP_CHANNEL_ID', str(ch_id), "قناة النسخ الاحتياطي المعتمدة")
-    elif ch_type == 'SUBSCRIPTION':
-        await sync_to_async(SystemSettingService.set_setting)('MANDATORY_SUBSCRIPTION_ENABLED', 'true', "تفعيل الاشتراك الإجباري")
-
-    # Perform live audit report
-    report = await ChannelAuditService.audit_channel(
-        bot=bot,
+    audit = await ChannelAuditService.audit_channel(
+        bot=message.bot,
         channel_id=ch.channel_id,
-        channel_type=ch_type
+        channel_type='CUSTOM'
     )
 
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🧪 فحص الجاهزية مرة أخرى", callback_data=f"adm_ch_test:{ch.id}")],
         [InlineKeyboardButton(text="📢 عرض كافة القنوات", callback_data="adm_channels_list")],
         [InlineKeyboardButton(text="🏠 الرئيسية", callback_data="adm_home")]
     ])
 
-    await target_msg.answer(
-        f"✅ <b>تمت إضافة القناة وتحديد دورها بنجاح!</b>\n\n"
-        f"{report['report_text']}",
+    await message.answer(
+        f"✅ <b>تمت إضافة قناة الاشتراك الإجباري بنجاح!</b>\n\n"
+        f"{audit['report_text']}",
         reply_markup=markup,
         parse_mode='HTML'
     )

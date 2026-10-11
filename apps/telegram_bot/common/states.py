@@ -64,6 +64,9 @@ class AdminAddChannelStates(StatesGroup):
     waiting_for_type = State()
     waiting_for_invite_link = State()
 
+class AdminChannelConfigStates(StatesGroup):
+    waiting_for_channel_input = State()
+
 class AdminAddDigitalServiceStates(StatesGroup):
     waiting_for_name = State()
     waiting_for_desc = State()

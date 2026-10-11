@@ -57,3 +57,15 @@ class EncryptionTests(TestCase):
     def test_missing_key_fails_loudly(self):
         with self.assertRaisesMessage(Exception, "DATA_ENCRYPTION_KEY"):
             encrypt_data("secret-value")
+
+
+class OrderNumberGenerationTests(TestCase):
+    def test_order_number_format_and_uniqueness(self):
+        from apps.orders.models import generate_order_number
+        numbers = set()
+        for _ in range(100):
+            num = generate_order_number()
+            self.assertTrue(num.startswith("ORD-"))
+            self.assertNotIn(num, numbers)
+            numbers.add(num)
+

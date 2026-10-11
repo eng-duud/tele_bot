@@ -1,3 +1,4 @@
+import os
 import logging
 import re
 import time
@@ -7,6 +8,7 @@ from django.conf import settings
 from apps.notifications.models import RequiredChannel
 from apps.orders.models import Order
 from apps.payments.models import PaymentRequest
+from apps.core.services import SystemSettingService
 
 logger = logging.getLogger(__name__)
 
@@ -81,43 +83,72 @@ class ChannelSubscriptionService:
             db_channels = _CHANNELS_CACHE
         else:
             try:
-                db_channels = await sync_to_async(list)(
-                    RequiredChannel.objects.filter(channel_type='SUBSCRIPTION', is_mandatory=True, is_active=True)
+                # 1. Fetch from RequiredChannel table (excluding non-public roles)
+                raw_qs = await sync_to_async(list)(
+                    RequiredChannel.objects.filter(
+                        is_active=True,
+                        is_mandatory=True
+                    ).exclude(channel_type__in=['SUPPORT', 'ADMIN', 'BACKUP', 'ALERTS'])
                 )
+                
+                # 2. Check dynamic SystemSetting overrides for official and activations channel
+                official_id = (
+                    await sync_to_async(SystemSettingService.get_setting)('OFFICIAL_CHANNEL_ID', '') or
+                    await sync_to_async(SystemSettingService.get_setting)('REQUIRED_CHANNEL_ID', '') or
+                    getattr(settings, 'REQUIRED_CHANNEL_ID', '') or
+                    os.getenv('REQUIRED_CHANNEL_ID', '')
+                ).strip()
+                official_mandatory = await sync_to_async(SystemSettingService.get_bool)('OFFICIAL_CHANNEL_MANDATORY', True)
+
+                success_id = (
+                    await sync_to_async(SystemSettingService.get_setting)('SUCCESS_CHANNEL_ID', '') or
+                    getattr(settings, 'SUCCESS_CHANNEL_ID', '') or
+                    os.getenv('SUCCESS_CHANNEL_ID', '')
+                ).strip()
+                success_mandatory = await sync_to_async(SystemSettingService.get_bool)('SUCCESS_CHANNEL_MANDATORY', True)
+
+                # Combine and deduplicate
+                channel_map = {}
+                for ch in raw_qs:
+                    clean_key = str(ch.channel_id).strip()
+                    if clean_key:
+                        channel_map[clean_key] = ch
+
+                # Ensure official channel is present if enabled
+                if official_id and official_mandatory and official_id not in channel_map:
+                    off_title = await sync_to_async(SystemSettingService.get_setting)('OFFICIAL_CHANNEL_TITLE', 'قناة البوت الرسمية')
+                    off_url = await sync_to_async(SystemSettingService.get_setting)('OFFICIAL_CHANNEL_URL', '')
+                    channel_map[official_id] = SimpleNamespace(
+                        channel_id=official_id,
+                        channel_title=off_title,
+                        invite_link=off_url,
+                        channel_type='OFFICIAL',
+                        is_mandatory=True,
+                        is_active=True
+                    )
+
+                # Ensure activations channel is present if enabled as mandatory
+                if success_id and success_mandatory and success_id not in channel_map:
+                    suc_title = await sync_to_async(SystemSettingService.get_setting)('SUCCESS_CHANNEL_TITLE', 'قناة التفعيلات')
+                    suc_url = await sync_to_async(SystemSettingService.get_setting)('SUCCESS_CHANNEL_URL', '')
+                    channel_map[success_id] = SimpleNamespace(
+                        channel_id=success_id,
+                        channel_title=suc_title,
+                        invite_link=suc_url,
+                        channel_type='SUCCESS',
+                        is_mandatory=True,
+                        is_active=True
+                    )
+
+                db_channels = list(channel_map.values())
             except Exception as db_err:
-                logger.warning(f"Could not load required channels from DB: {db_err}")
+                logger.warning(f"Could not load required channels: {db_err}")
                 db_channels = []
+
             _CHANNELS_CACHE = db_channels
             _CHANNELS_CACHE_TIME = now
 
         all_channels = list(db_channels)
-
-        # Allow optional initial bootstrap from SystemSetting or .env if DB has no channels yet
-        env_channel_id = (
-            await sync_to_async(SystemSettingService.get_setting)('REQUIRED_CHANNEL_ID', '') or
-            getattr(settings, 'REQUIRED_CHANNEL_ID', '') or 
-            os.getenv('REQUIRED_CHANNEL_ID', '')
-        ).strip()
-        if env_channel_id and not all_channels:
-            if not env_channel_id.startswith('@your') and env_channel_id.lower() != 'none':
-                env_title = await sync_to_async(SystemSettingService.get_setting)('REQUIRED_CHANNEL_TITLE', '') or getattr(settings, 'REQUIRED_CHANNEL_TITLE', '') or 'قناة المتجر'
-                env_url = await sync_to_async(SystemSettingService.get_setting)('REQUIRED_CHANNEL_URL', '') or getattr(settings, 'REQUIRED_CHANNEL_URL', '') or (f"https://t.me/{env_channel_id.lstrip('@')}" if env_channel_id.startswith('@') else '')
-                try:
-                    def _sync_env_to_db():
-                        ch, _ = RequiredChannel.objects.get_or_create(
-                            channel_id=env_channel_id,
-                            defaults={
-                                'channel_title': env_title,
-                                'invite_link': env_url,
-                                'is_mandatory': True,
-                                'is_active': True,
-                            }
-                        )
-                        return ch
-                    synced = await sync_to_async(_sync_env_to_db)()
-                    all_channels.append(synced)
-                except Exception as sync_e:
-                    logger.debug(f"Could not bootstrap channel from settings: {sync_e}")
 
         if not all_channels:
             return []
@@ -593,7 +624,16 @@ class AdminGroupNotifierService:
             return None
 
         # 2. Deliver exclusively to Admin Group / Channel if configured
-        admin_group_id = getattr(settings, 'ADMIN_GROUP_ID', '')
+        admin_group_id = (
+            await sync_to_async(SystemSettingService.get_setting)('ADMIN_CHANNEL_ID', '') or
+            getattr(settings, 'ADMIN_GROUP_ID', '') or
+            os.getenv('ADMIN_GROUP_ID', '')
+        ).strip()
+        if not admin_group_id:
+            def _get_admin_ch():
+                ch = RequiredChannel.objects.filter(channel_type='ADMIN', is_active=True).first()
+                return ch.channel_id if ch else ''
+            admin_group_id = (await sync_to_async(_get_admin_ch)()).strip()
         delivered_to_group = False
 
         if admin_group_id:

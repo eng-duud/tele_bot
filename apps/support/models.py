@@ -1,15 +1,15 @@
-import random
-import string
+import secrets
 from django.db import models
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from apps.core.models import TimeStampedModel
 from apps.users.models import TelegramProfile
 
 def generate_ticket_number() -> str:
-    """Generate friendly ticket code like TIC-92814."""
-    chars = string.digits
-    code = ''.join(random.choices(chars, k=5))
-    return f"TIC-{code}"
+    """Generate friendly and unique ticket code e.g. TIC-261011-9B3E."""
+    today = timezone.now().strftime("%y%m%d")
+    entropy = secrets.token_hex(2).upper()
+    return f"TIC-{today}-{entropy}"
 
 class SupportTicket(TimeStampedModel):
     """Customer support ticket conversation."""

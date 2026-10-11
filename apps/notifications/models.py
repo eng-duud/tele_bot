@@ -5,15 +5,19 @@ from apps.core.models import TimeStampedModel
 class RequiredChannel(TimeStampedModel):
     """Dynamic channels manager for subscriptions, success broadcasts, and backups."""
     CHANNEL_TYPE_CHOICES = (
+        ('OFFICIAL', '📢 قناة البوت الرسمية'),
+        ('SUCCESS', '⚡ قناة التفعيلات والعمليات الناجحة'),
+        ('SUPPORT', '🎧 قناة / مجموعة الدعم الفني'),
+        ('ADMIN', '🛡️ قناة / مجموعة إشعارات الإدارة'),
+        ('CUSTOM', '🔒 قناة اشتراك إجباري إضافية'),
         ('SUBSCRIPTION', '🔒 اشتراك إجباري للعملاء'),
-        ('SUCCESS', '📢 نشر التفعيلات والعمليات الناجحة'),
         ('BACKUP', '📦 نسخ احتياطي للبيانات'),
         ('ALERTS', '🔔 إشعارات الإدارة والمشرفين'),
     )
 
-    channel_id = models.CharField(_('معرف القناة أو اليوزر (مثال: @Channel أو -100...)'), max_length=120, unique=True)
+    channel_id = models.CharField(_('معرف القناة أو اليوزر (مثال: @Channel أو -100...)'), max_length=120, db_index=True)
     channel_title = models.CharField(_('اسم القناة'), max_length=150)
-    channel_type = models.CharField(_('نوع القناة والغرض منها'), max_length=30, choices=CHANNEL_TYPE_CHOICES, default='SUBSCRIPTION', db_index=True)
+    channel_type = models.CharField(_('نوع القناة والغرض منها'), max_length=30, choices=CHANNEL_TYPE_CHOICES, default='OFFICIAL', db_index=True)
     invite_link = models.URLField(_('رابط الدعوة للقناة'), blank=True, default='')
     is_mandatory = models.BooleanField(_('إجباري للدخول'), default=True)
     is_active = models.BooleanField(_('مفعلة'), default=True)

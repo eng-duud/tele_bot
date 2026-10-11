@@ -23,7 +23,7 @@ class SupportServiceTestCase(TestCase):
             text="عندي مشكلة في شحن الرصيد برقم العملية 12345"
         )
         self.assertIsNotNone(ticket.id)
-        self.assertTrue(ticket.ticket_number.startswith("TK-"))
+        self.assertTrue(ticket.ticket_number.startswith("TIC-"))
         self.assertEqual(ticket.status, "OPEN")
         self.assertEqual(msg.ticket, ticket)
         self.assertEqual(msg.sender, self.customer)
@@ -70,3 +70,15 @@ class SupportServiceTestCase(TestCase):
             reply_text="محاولة رد بعد الإغلاق"
         )
         self.assertFalse(fail_success)
+
+
+class TicketNumberGenerationTests(TestCase):
+    def test_ticket_number_format_and_uniqueness(self):
+        from apps.support.models import generate_ticket_number
+        numbers = set()
+        for _ in range(100):
+            num = generate_ticket_number()
+            self.assertTrue(num.startswith("TIC-"))
+            self.assertNotIn(num, numbers)
+            numbers.add(num)
+

@@ -136,11 +136,42 @@ class SupportService:
         from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
         from apps.telegram_bot.common.bot_instances import get_admin_bot
 
+        from apps.core.services import SystemSettingService
+        from apps.notifications.models import RequiredChannel
+
         admin_bot = get_admin_bot() or bot
-        admin_group_id = getattr(settings, 'ADMIN_GROUP_ID', '')
-        if not admin_group_id:
-            logger.warning("ADMIN_GROUP_ID not configured, support ticket card not sent to group.")
+
+        def _get_support_target():
+            # 1. DB Support Channel
+            sup_ch = RequiredChannel.objects.filter(channel_type='SUPPORT', is_active=True).first()
+            if sup_ch and sup_ch.channel_id:
+                return str(sup_ch.channel_id).strip()
+            # 2. SystemSetting SUPPORT_CHANNEL_ID
+            val = SystemSettingService.get_setting('SUPPORT_CHANNEL_ID', '').strip()
+            if val:
+                return val
+            # 3. settings.SUPPORT_CHANNEL_ID
+            env_val = getattr(settings, 'SUPPORT_CHANNEL_ID', '').strip()
+            if env_val:
+                return env_val
+            # 4. DB Admin Channel
+            adm_ch = RequiredChannel.objects.filter(channel_type='ADMIN', is_active=True).first()
+            if adm_ch and adm_ch.channel_id:
+                return str(adm_ch.channel_id).strip()
+            # 5. settings.ADMIN_GROUP_ID
+            group_env = getattr(settings, 'ADMIN_GROUP_ID', '')
+            if group_env:
+                return str(group_env).strip()
+            # 6. Fallback to Super Admin ID
+            super_id = getattr(settings, 'SUPER_ADMIN_TELEGRAM_ID', 0)
+            return str(super_id) if super_id else ""
+
+        support_target = await sync_to_async(_get_support_target)()
+        if not support_target:
+            logger.warning("No support channel, admin group, or super admin configured to receive tickets.")
             return
+
+        target_chat_id = int(support_target) if (support_target.startswith('-') or support_target.isdigit()) else support_target
 
         raw_user_name = ticket.user.full_name or "عميل"
         u_name = html.escape(raw_user_name)
@@ -183,7 +214,7 @@ class SupportService:
             if msg.photo_file_id:
                 try:
                     sent = await admin_bot.send_photo(
-                        chat_id=admin_group_id,
+                        chat_id=target_chat_id,
                         photo=msg.photo_file_id,
                         caption=card_text,
                         reply_markup=markup,
@@ -191,14 +222,14 @@ class SupportService:
                     )
                 except Exception:
                     sent = await admin_bot.send_message(
-                        chat_id=admin_group_id,
+                        chat_id=target_chat_id,
                         text=card_text,
                         reply_markup=markup,
                         parse_mode='HTML'
                     )
             else:
                 sent = await admin_bot.send_message(
-                    chat_id=admin_group_id,
+                    chat_id=target_chat_id,
                     text=card_text,
                     reply_markup=markup,
                     parse_mode='HTML'

@@ -1,13 +1,16 @@
-import random
+import secrets
 from django.db import models
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from apps.core.models import TimeStampedModel
 from apps.users.models import TelegramProfile
 from apps.catalog.models import Product
 
 def generate_order_number() -> str:
-    """Generate a clean human-readable order number e.g. ORD-847291."""
-    return f"ORD-{random.randint(100000, 999999)}"
+    """Generate a collision-resistant unique order number e.g. ORD-261011-A8F2."""
+    date_part = timezone.now().strftime("%y%m%d")
+    entropy = secrets.token_hex(2).upper()
+    return f"ORD-{date_part}-{entropy}"
 
 class Order(TimeStampedModel):
     """Customer purchase order with immutable pricing and full state machine."""
