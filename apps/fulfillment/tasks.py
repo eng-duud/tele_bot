@@ -31,7 +31,12 @@ def execute_order_fulfillment(self, order_id: str):
     # Get or create task log
     task, _ = FulfillmentTask.objects.get_or_create(
         order=order,
-        defaults={'status': 'RUNNING', 'attempts': 0, 'max_attempts': 3}
+        defaults={
+            'status': 'RUNNING',
+            'attempts': 0,
+            'max_attempts': 3,
+            'provider_idempotency_key': f"fulfill-{order.order_number}"
+        }
     )
     task.attempts += 1
     task.status = 'RUNNING'

@@ -82,7 +82,7 @@ class ChannelSubscriptionService:
         else:
             try:
                 db_channels = await sync_to_async(list)(
-                    RequiredChannel.objects.filter(is_mandatory=True, is_active=True)
+                    RequiredChannel.objects.filter(channel_type='SUBSCRIPTION', is_mandatory=True, is_active=True)
                 )
             except Exception as db_err:
                 logger.warning(f"Could not load required channels from DB: {db_err}")
@@ -159,6 +159,137 @@ class ChannelSubscriptionService:
 
 
 
+class ChannelAuditService:
+    """Service to test, inspect, and verify bot permissions inside any channel or group."""
+
+    @staticmethod
+    def clean_identifier(identifier: str):
+        """Clean username, URL, or numeric ID into Telegram-usable chat_id."""
+        val = str(identifier).strip()
+        if 't.me/' in val:
+            part = val.split('t.me/')[-1].split('/')[0].split('?')[0].strip()
+            if not part.startswith('+') and not part.startswith('joinchat'):
+                val = f"@{part}"
+        if val.startswith('-') or (val.isdigit()):
+            try:
+                return int(val)
+            except ValueError:
+                pass
+        return val
+
+    @classmethod
+    async def audit_channel(cls, bot, channel_id: str, channel_type: str = 'SUBSCRIPTION') -> dict:
+        """Perform complete diagnostic on a Telegram channel/chat."""
+        import html
+        from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+
+        cid = cls.clean_identifier(channel_id)
+        report = {
+            'success': False,
+            'chat_title': str(channel_id),
+            'chat_id': str(cid),
+            'is_in_chat': False,
+            'is_admin': False,
+            'can_post': False,
+            'can_invite': False,
+            'report_text': '',
+            'error': None
+        }
+
+        type_labels = {
+            'SUBSCRIPTION': '🔒 اشتراك إجباري للعملاء',
+            'SUCCESS': '📢 نشر التفعيلات والعمليات الناجحة',
+            'BACKUP': '📦 نسخ احتياطي للبيانات',
+            'ALERTS': '🔔 إشعارات الإدارة والمشرفين',
+        }
+        type_str = type_labels.get(channel_type, channel_type)
+
+        try:
+            bot_me = await bot.get_me()
+            chat = await bot.get_chat(chat_id=cid)
+            report['chat_title'] = chat.title or str(channel_id)
+            report['is_in_chat'] = True
+
+            member = await bot.get_chat_member(chat_id=cid, user_id=bot_me.id)
+            status = getattr(member, 'status', '')
+
+            if status in ('administrator', 'creator'):
+                report['is_admin'] = True
+                report['can_post'] = getattr(member, 'can_post_messages', False) or getattr(member, 'can_send_messages', False) or (status == 'creator')
+                report['can_invite'] = getattr(member, 'can_invite_users', False) or (status == 'creator')
+
+            if channel_type in ('SUCCESS', 'BACKUP', 'ALERTS'):
+                is_ready = report['is_admin'] and report['can_post']
+            else:
+                is_ready = report['is_admin']
+
+            report['success'] = is_ready
+
+            in_icon = "✅ البوت موجود داخل القناة" if report['is_in_chat'] else "❌ البوت غير موجود"
+            admin_icon = "✅ رتبة مشرف (Admin)" if report['is_admin'] else "❌ ليس مشرفاً (عضو عادي أو غير مضاف)"
+            post_icon = "✅ متاح ومصرّح" if report['can_post'] else ("❌ غير متاح (تنقصه صلاحية النشر)" if report['is_admin'] else "⚪ غير متاح")
+            invite_icon = "✅ متاح" if report['can_invite'] else "⚪ اختياري"
+
+            readiness_badge = (
+                "🎉 <b>النتيجة: القناة جاهزة ومؤهلة بنسبة 100%!</b> ✅"
+                if is_ready else
+                "⚠️ <b>النتيجة: القناة غير جاهزة بالكامل بعد!</b> ❌"
+            )
+
+            advice = ""
+            if not report['is_admin']:
+                advice = (
+                    "\n💡 <b>خطوات التجهيز المطلوبة:</b>\n"
+                    "1. افتح إعدادات القناة في تيليجرام ⬅️ الإداريون (Administrators).\n"
+                    f"2. أضف البوت <code>@{bot_me.username}</code> كمشرف.\n"
+                    "3. امنحه صلاحية <b>نشر الرسائل (Post Messages)</b> ودعوة المستخدمين."
+                )
+            elif not report['can_post'] and channel_type in ('SUCCESS', 'BACKUP', 'ALERTS'):
+                advice = (
+                    "\n💡 <b>تنبيه صلاحيات:</b> البوت مشرف لكن تنقصه صلاحية <b>نشر الرسائل (Post Messages)</b> داخل القناة."
+                )
+
+            report['report_text'] = (
+                f"📡 <b>تقرير فحص صلاحيات وجاهزية القناة</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🏷️ <b>اسم القناة:</b> <b>{html.escape(report['chat_title'])}</b>\n"
+                f"🆔 <b>معرف القناة:</b> <code>{html.escape(str(cid))}</code>\n"
+                f"📌 <b>الغرض في النظام:</b> <b>{type_str}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🤖 <b>فحص حالة البوت:</b>\n"
+                f" • الوجود في القناة: {in_icon}\n"
+                f" • الرتبة الحالية: {admin_icon}\n"
+                f" • صلاحية نشر الرسائل: {post_icon}\n"
+                f" • صلاحية فحص الأعضاء: {invite_icon}\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"{readiness_badge}"
+                f"{advice}"
+            )
+            return report
+
+        except (TelegramBadRequest, TelegramForbiddenError) as e:
+            err = str(e)
+            report['error'] = err
+            report['report_text'] = (
+                f"❌ <b>فشل فحص القناة:</b>\n"
+                f"المعرف: <code>{html.escape(str(cid))}</code>\n"
+                f"الغرض: <b>{type_str}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"⚠️ <b>السبب:</b> <code>{html.escape(err)}</code>\n\n"
+                f"💡 <b>الحل الموصى به:</b>\n"
+                f"1. تأكد من صحة معرف القناة (مثال: <code>@channel_username</code> أو الآيدي <code>-100...</code>).\n"
+                f"2. أضف بوت المتجر كمشرف داخل القناة أولاً، ثم أعد الفحص."
+            )
+            return report
+        except Exception as e:
+            report['error'] = str(e)
+            report['report_text'] = (
+                f"❌ <b>خطأ غير متوقع أثناء فحص القناة:</b>\n"
+                f"<code>{html.escape(str(e))}</code>"
+            )
+            return report
+
+
 class SuccessChannelService:
     """Publish sanitized receipts to the public success channel."""
 
@@ -200,7 +331,13 @@ class SuccessChannelService:
             if not is_enabled:
                 return
 
+            def _get_target_success_channel():
+                ch = RequiredChannel.objects.filter(channel_type='SUCCESS', is_active=True).first()
+                return ch.channel_id if ch else None
+
+            db_ch = await sync_to_async(_get_target_success_channel)()
             channel_id = (
+                db_ch or
                 await sync_to_async(SystemSettingService.get_setting)('SUCCESS_CHANNEL_ID', '') or
                 getattr(settings, 'SUCCESS_CHANNEL_ID', '')
             ).strip()

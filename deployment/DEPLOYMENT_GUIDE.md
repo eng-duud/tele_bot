@@ -59,7 +59,7 @@ CREATE DATABASE telebot_db OWNER telebot_db_user;
 ```bash
 sudo -u telebot -H bash
 cd /var/www/tele_bot
-git clone https://github.com/eng-duud/tele_bot.git .
+git clone https://github.com/your-username/tele_bot.git .
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip

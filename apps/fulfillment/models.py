@@ -16,8 +16,14 @@ class FulfillmentTask(TimeStampedModel):
     order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='fulfillment_tasks', verbose_name=_('الطلب'))
     status = models.CharField(_('حالة المهمة'), max_length=20, choices=STATUS_CHOICES, default='QUEUED', db_index=True)
     attempts = models.PositiveIntegerField(_('عدد المحاولات'), default=0)
-    max_attempts = models.PositiveIntegerField(_('الحد الأقصى للمحاولات'), default=3)
     last_error = models.TextField(_('آخر خطأ مسجل'), blank=True)
+    provider_idempotency_key = models.CharField(
+        _('مفتاح منع تكرار المزود'),
+        max_length=255,
+        blank=True,
+        null=True,
+        default=''
+    )
 
     class Meta:
         verbose_name = _('مهمة تسليم')

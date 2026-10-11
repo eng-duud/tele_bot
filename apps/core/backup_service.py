@@ -92,6 +92,13 @@ class DatabaseBackupService:
         """
         # Resolve destination
         if not target_chat_id:
+            def _get_target_backup_channel():
+                from apps.notifications.models import RequiredChannel
+                ch = RequiredChannel.objects.filter(channel_type='BACKUP', is_active=True).first()
+                return ch.channel_id if ch else None
+            target_chat_id = await sync_to_async(_get_target_backup_channel)()
+
+        if not target_chat_id:
             target_chat_id = await sync_to_async(SystemSettingService.get_setting)('BACKUP_CHANNEL_ID', '')
         
         if not target_chat_id:

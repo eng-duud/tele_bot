@@ -48,6 +48,14 @@ class Command(BaseCommand):
     help = 'Run both Customer Bot and Admin Bot concurrently in one process'
 
     def handle(self, *args, **options):
+        # Ensure database migrations are applied automatically
+        try:
+            from django.core.management import call_command
+            call_command('migrate', interactive=False)
+            self.stdout.write(self.style.SUCCESS("✅ Database migrations verified and up to date."))
+        except Exception as mig_err:
+            logger.warning(f"Auto-migration notice: {mig_err}")
+
         # Preload active exchange rate synchronously into in-memory cache
         current_rate = ExchangeRate.get_usd_to_yer_rate()
         self.stdout.write(self.style.NOTICE(f"💵 Active Exchange Rate loaded: 1 USD = {current_rate:,.0f} YER"))

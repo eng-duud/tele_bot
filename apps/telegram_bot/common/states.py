@@ -59,8 +59,9 @@ class AdminManualWalletStates(StatesGroup):
     waiting_for_amount = State()
 
 class AdminAddChannelStates(StatesGroup):
-    waiting_for_title = State()
     waiting_for_channel_id = State()
+    waiting_for_title = State()
+    waiting_for_type = State()
     waiting_for_invite_link = State()
 
 class AdminAddDigitalServiceStates(StatesGroup):
