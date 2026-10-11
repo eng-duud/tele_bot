@@ -1,4 +1,7 @@
 import logging
+import re
+import time
+from pathlib import Path
 from typing import List, Tuple
 from django.conf import settings
 from apps.notifications.models import RequiredChannel
@@ -9,7 +12,42 @@ logger = logging.getLogger(__name__)
 
 from asgiref.sync import sync_to_async
 
-import time
+
+def extract_migrated_chat_id(err: Exception):
+    params = getattr(err, 'parameters', None)
+    if params and getattr(params, 'migrate_to_chat_id', None):
+        return params.migrate_to_chat_id
+    msg = str(err)
+    match = re.search(r'migrated to a supergroup with id\s*(-?\d+)', msg, re.IGNORECASE)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            pass
+    match2 = re.search(r'migrate_to_chat_id\s*=\s*(-?\d+)', msg, re.IGNORECASE)
+    if match2:
+        try:
+            return int(match2.group(1))
+        except ValueError:
+            pass
+    return None
+
+
+def update_env_group_id(new_id: str):
+    try:
+        env_path = Path(settings.BASE_DIR) / '.env'
+        if not env_path.exists():
+            return
+        content = env_path.read_text(encoding='utf-8')
+        if 'ADMIN_GROUP_ID=' in content:
+            new_content = re.sub(r'ADMIN_GROUP_ID=[^\r\n]*', f'ADMIN_GROUP_ID={new_id}', content)
+        else:
+            new_content = content + f"\nADMIN_GROUP_ID={new_id}\n"
+        env_path.write_text(new_content, encoding='utf-8')
+        logger.info(f"✅ Auto-updated ADMIN_GROUP_ID={new_id} in .env file.")
+    except Exception as env_err:
+        logger.warning(f"Could not persist ADMIN_GROUP_ID in .env: {env_err}")
+
 
 _CHANNELS_CACHE = None
 _CHANNELS_CACHE_TIME = 0.0
@@ -31,6 +69,12 @@ class ChannelSubscriptionService:
         import os
         from types import SimpleNamespace
         from aiogram.exceptions import TelegramBadRequest
+        from apps.core.services import SystemSettingService
+
+        # Check if mandatory subscription is globally enabled from admin panel
+        is_sub_enabled = await sync_to_async(SystemSettingService.get_bool)('MANDATORY_SUBSCRIPTION_ENABLED', True)
+        if not is_sub_enabled:
+            return []
 
         now = time.time()
         if _CHANNELS_CACHE is not None and (now - _CHANNELS_CACHE_TIME < 20.0):
@@ -46,57 +90,38 @@ class ChannelSubscriptionService:
             _CHANNELS_CACHE = db_channels
             _CHANNELS_CACHE_TIME = now
 
-        # Also incorporate channels configured in .env (قناة المتجر وقناة التفعيلات)
-        env_channels_config = [
-            {
-                'id': (getattr(settings, 'REQUIRED_CHANNEL_ID', '') or os.getenv('REQUIRED_CHANNEL_ID', '')).strip(),
-                'url': (getattr(settings, 'REQUIRED_CHANNEL_URL', '') or os.getenv('REQUIRED_CHANNEL_URL', '')).strip(),
-                'title': (getattr(settings, 'REQUIRED_CHANNEL_TITLE', '') or os.getenv('REQUIRED_CHANNEL_TITLE', 'قناة المتجر الرسمية')).strip() or 'قناة المتجر الرسمية'
-            },
-            {
-                'id': (getattr(settings, 'SUCCESS_CHANNEL_ID', '') or os.getenv('SUCCESS_CHANNEL_ID', '')).strip(),
-                'url': (getattr(settings, 'SUCCESS_CHANNEL_URL', '') or os.getenv('SUCCESS_CHANNEL_URL', '')).strip(),
-                'title': (getattr(settings, 'SUCCESS_CHANNEL_TITLE', '') or os.getenv('SUCCESS_CHANNEL_TITLE', 'قناة التفعيلات المباشرة')).strip() or 'قناة التفعيلات المباشرة'
-            }
-        ]
-
         all_channels = list(db_channels)
 
-        for cfg in env_channels_config:
-            cid = cfg['id']
-            if cid and cid.lower() not in ('@yourchannel', '@your_channel', 'your_channel_id', '@yourstore', 'none', ''):
-                already_in_list = any(str(getattr(c, 'channel_id', '')).lower() == cid.lower() for c in all_channels)
-                invite = cfg['url'] or (f"https://t.me/{cid.lstrip('@')}" if cid.startswith('@') else "")
-                
-                if not already_in_list:
-                    env_obj = SimpleNamespace(
-                        id=f'env_{cid}',
-                        channel_id=cid,
-                        channel_title=cfg['title'],
-                        invite_link=invite,
-                        is_mandatory=True,
-                        is_active=True
-                    )
-                    all_channels.append(env_obj)
-
-                # Auto-sync/upsert to DB so it persists and is visible in admin dashboard
+        # Allow optional initial bootstrap from SystemSetting or .env if DB has no channels yet
+        env_channel_id = (
+            await sync_to_async(SystemSettingService.get_setting)('REQUIRED_CHANNEL_ID', '') or
+            getattr(settings, 'REQUIRED_CHANNEL_ID', '') or 
+            os.getenv('REQUIRED_CHANNEL_ID', '')
+        ).strip()
+        if env_channel_id and not all_channels:
+            if not env_channel_id.startswith('@your') and env_channel_id.lower() != 'none':
+                env_title = await sync_to_async(SystemSettingService.get_setting)('REQUIRED_CHANNEL_TITLE', '') or getattr(settings, 'REQUIRED_CHANNEL_TITLE', '') or 'قناة المتجر'
+                env_url = await sync_to_async(SystemSettingService.get_setting)('REQUIRED_CHANNEL_URL', '') or getattr(settings, 'REQUIRED_CHANNEL_URL', '') or (f"https://t.me/{env_channel_id.lstrip('@')}" if env_channel_id.startswith('@') else '')
                 try:
-                    def _sync_env_to_db(ch_id=cid, ch_title=cfg['title'], ch_link=invite):
-                        RequiredChannel.objects.update_or_create(
-                            channel_id=ch_id,
+                    def _sync_env_to_db():
+                        ch, _ = RequiredChannel.objects.get_or_create(
+                            channel_id=env_channel_id,
                             defaults={
-                                'channel_title': ch_title,
-                                'invite_link': ch_link or f"https://t.me/{ch_id.lstrip('@')}",
+                                'channel_title': env_title,
+                                'invite_link': env_url,
                                 'is_mandatory': True,
                                 'is_active': True,
                             }
                         )
-                    await sync_to_async(_sync_env_to_db)()
+                        return ch
+                    synced = await sync_to_async(_sync_env_to_db)()
+                    all_channels.append(synced)
                 except Exception as sync_e:
-                    logger.debug(f"Could not auto-sync channel {cid} to DB: {sync_e}")
+                    logger.debug(f"Could not bootstrap channel from settings: {sync_e}")
 
         if not all_channels:
             return []
+
 
         missing = []
         for ch in all_channels:
@@ -170,21 +195,30 @@ class SuccessChannelService:
             if not bot or not order:
                 return
 
-            channel_id = getattr(settings, 'SUCCESS_CHANNEL_ID', '')
-            if not channel_id or channel_id.startswith('@YourStore'):
+            from apps.core.services import SystemSettingService, CurrencyService
+            is_enabled = await sync_to_async(SystemSettingService.get_bool)('SUCCESS_CHANNEL_ENABLED', True)
+            if not is_enabled:
+                return
+
+            channel_id = (
+                await sync_to_async(SystemSettingService.get_setting)('SUCCESS_CHANNEL_ID', '') or
+                getattr(settings, 'SUCCESS_CHANNEL_ID', '')
+            ).strip()
+            if not channel_id or channel_id.startswith('@YourStore') or channel_id in ('0', 'none', '-'):
                 return
 
             prod_name, total_qty, masked_id = await sync_to_async(cls._extract_broadcast_data)(order)
 
             import html
             esc_prod = html.escape(prod_name)
+            price_formatted = CurrencyService.format_dual_price(order.total_amount_yer)
             text = (
                 f"🎉 <b>عملية شراء وتسليم ناجحة!</b> ⚡\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"🔖 <b>رقم الطلب:</b> <code>{order.order_number}</code>\n"
                 f"🛍 <b>المنتج:</b> <b>{esc_prod}</b>\n"
                 f"🔢 <b>الكمية:</b> <b>{total_qty} قطعة</b>\n"
-                f"💰 <b>الإجمالي:</b> <b>{order.total_amount_yer:,.0f} YER</b>\n"
+                f"💰 <b>الإجمالي:</b> <b>{price_formatted}</b>\n"
                 f"👤 <b>المشتري:</b> العميل <code>{masked_id}</code>\n"
                 f"⚡ <b>حالة التسليم:</b> فوري ومباشر وآلي ✅\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
@@ -197,7 +231,7 @@ class SuccessChannelService:
                 f"🔖 رقم الطلب: {order.order_number}\n"
                 f"🛍 المنتج: {prod_name}\n"
                 f"🔢 الكمية: {total_qty} قطعة\n"
-                f"💰 الإجمالي: {order.total_amount_yer:,.0f} YER\n"
+                f"💰 الإجمالي: {price_formatted}\n"
                 f"👤 المشتري: العميل {masked_id}\n"
                 f"⚡ حالة التسليم: فوري ومباشر وآلي ✅\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
@@ -335,44 +369,6 @@ class AdminGroupNotifierService:
                             break
                 except Exception as dl_err:
                     logger.debug(f"Could not download receipt image using {dl_bot}: {dl_err}")
-
-        # Helper to extract migrated supergroup ID
-        import re
-        from pathlib import Path
-
-        def extract_migrated_chat_id(err: Exception):
-            params = getattr(err, 'parameters', None)
-            if params and getattr(params, 'migrate_to_chat_id', None):
-                return params.migrate_to_chat_id
-            msg = str(err)
-            match = re.search(r'migrated to a supergroup with id\s*(-?\d+)', msg, re.IGNORECASE)
-            if match:
-                try:
-                    return int(match.group(1))
-                except ValueError:
-                    pass
-            match2 = re.search(r'migrate_to_chat_id\s*=\s*(-?\d+)', msg, re.IGNORECASE)
-            if match2:
-                try:
-                    return int(match2.group(1))
-                except ValueError:
-                    pass
-            return None
-
-        def update_env_group_id(new_id: str):
-            try:
-                env_path = Path(settings.BASE_DIR) / '.env'
-                if not env_path.exists():
-                    return
-                content = env_path.read_text(encoding='utf-8')
-                if 'ADMIN_GROUP_ID=' in content:
-                    new_content = re.sub(r'ADMIN_GROUP_ID=[^\r\n]*', f'ADMIN_GROUP_ID={new_id}', content)
-                else:
-                    new_content = content + f"\nADMIN_GROUP_ID={new_id}\n"
-                env_path.write_text(new_content, encoding='utf-8')
-                logger.info(f"✅ Auto-updated ADMIN_GROUP_ID={new_id} in .env file.")
-            except Exception as env_err:
-                logger.warning(f"Could not persist ADMIN_GROUP_ID in .env: {env_err}")
 
         # Delivery helper with complete multi-tier fallback and automatic supergroup migration handling
         async def _deliver(sender, target_chat_id):

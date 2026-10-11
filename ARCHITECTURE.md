@@ -44,14 +44,19 @@ tele_bot/
 │   └── urls.py
 │
 ├── apps/
-│   ├── core/                       # الأدوات العامة، أسعار الصرف، والتشفير
+│   ├── core/                       # محرك إعدادات النظام (SystemSettingService), التشفير, الصرف
 │   │   ├── models.py               # TimeStampedModel, ExchangeRate, SystemSetting
 │   │   ├── encryption.py           # دوال تشفير وفك تشفير البيانات الحساسة (Fernet)
-│   │   └── services.py             # دوال تحويل العملات وتنسيق الأسعار
+│   │   └── services.py             # دوال تحويل العملات، كاش إعدادات النظام الديناميكية
 │   │
-│   ├── users/                      # المستخدمين والملفات الشخصية والأذونات
-│   │   ├── models.py               # User, TelegramProfile, AdminRole, AdminPermission
-│   │   └── services.py             # تسجيل الدخول، فحص الصلاحيات
+│   ├── support/                    # نظام تذاكر الدعم الفني المدمج
+│   │   ├── models.py               # SupportTicket, TicketMessage
+│   │   ├── services.py             # دورة حياة التذكرة، توجيه البطاقات لمجموعة الإدارة
+│   │   └── admin.py                # لوحة تحكم تذاكر الدعم في Django Admin
+│   │
+│   ├── users/                      # المستخدمين، الإحالات والأرباح، الصلاحيات
+│   │   ├── models.py               # User, TelegramProfile (referred_by, referral_bonus_paid)
+│   │   └── services.py             # تسجيل الدخول، فحص الصلاحيات، محرك الإحالات (ReferralService)
 │   │
 │   ├── wallet/                     # المحفظة المالية وسجل الحركات المحاسبي
 │   │   ├── models.py               # Wallet, WalletTransaction (DEPOSIT, PURCHASE, REFUND, ADJUSTMENT)
@@ -140,6 +145,24 @@ tele_bot/
    - في حال كان التسليم من المخزون الداخلي (`INDIVIDUAL_ITEMS`): يتم فك تشفير الكود وإرساله للعميل مباشرة وتحديث حالة الطلب إلى `COMPLETED`.
    - في حال كان التسليم عبر مزود API خارجي: يقوم الـ Worker باستدعاء المزود واستلام الكود وتمريره للعميل.
    - نشر إشعار العملية الناجحة في قناة العمليات العامة (مع إخفاء أي بيانات حساسة).
+
+#### جـ. تدفق نظام الإحالات والأرباح (Referral Engine Flow):
+1. يشارك العميل رابطه الفريد: `https://t.me/<bot_username>?start=ref_<telegram_id>`.
+2. يدخل الصديق المدعو البوت عبر الرابط، فيقوم `UserAutoRegisterMiddleware` باستخراج معرف الداعي وتخزينه في `referred_by`.
+3. عند اجتياز الصديق المدعو لفحص القنوات الإجبارية والبدء الفعلي بالمتجر:
+   - يتم استدعاء `ReferralService.award_referral_bonus_if_eligible`.
+   - يتم التحقق من تفعيل النظام `REFERRAL_ENABLED` وجلب قيمة المكافأة `REFERRAL_BONUS_YER`.
+   - تتم إضافة المكافأة فورياً في محفظة الداعي عبر عملية ذرية (`DEPOSIT` / `REFERRAL_BONUS`).
+   - وضع علامة `referral_bonus_paid = True` لمنع أي دفع متكرر (Idempotency).
+   - إرسال إشعار تليجرام تلقائي للداعي بزيادة رصيده وتهنئته.
+
+#### د. تدفق تذاكر الدعم الفني المدمج (Support Ticketing Flow):
+1. يضغط العميل على زر `[🎧 الدعم الفني]` ثم `[✍️ فتح تذكرة وكتابة رسالة للدعم]`.
+2. يرسل العميل رسالته أو لقطة شاشة توضيحية.
+3. يقوم النظام بإنشاء `SupportTicket` برقم تسلسلي `TK-XXXXXX` ورسالة `TicketMessage`.
+4. يتم توليد بطاقة تفاعلية وإرسالها فوراً إلى **مجموعة الإدارة الخاصة (Admin Group)** بأزرار `[✍️ الرد على العميل]` و `[🔒 إغلاق التذكرة]`.
+5. يستطيع المشرف الرد إما بالضغط على الزر وكتابة الرد، أو باستخدام ميزة الرد المباشرة في تليجرام (Swipe to Reply).
+6. يُسلَّم الرد فورياً إلى محادثة العميل الخاصة عبر Customer Bot مع اسم المشرف ورقم التذكرة.
 
 ---
 

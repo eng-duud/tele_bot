@@ -13,6 +13,17 @@ app.config_from_object('django.conf:settings', namespace='CELERY')
 # Load task modules from all registered Django apps.
 app.autodiscover_tasks()
 
+from celery.signals import task_prerun, task_postrun
+from django.db import close_old_connections
+
+@task_prerun.connect
+def on_task_prerun(*args, **kwargs):
+    close_old_connections()
+
+@task_postrun.connect
+def on_task_postrun(*args, **kwargs):
+    close_old_connections()
+
 @app.task(bind=True, ignore_result=True)
 def debug_task(self):
     print(f'Request: {self.request!r}')

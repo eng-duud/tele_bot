@@ -1,31 +1,42 @@
 import asyncio
 import logging
 from django.core.management.base import BaseCommand
+from django.db import InterfaceError, OperationalError
+from asgiref.sync import sync_to_async
 from aiogram import Dispatcher
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import ErrorEvent
 from apps.core.models import ExchangeRate
 from apps.telegram_bot.common.bot_instances import get_customer_bot, get_admin_bot
 from apps.telegram_bot.common.middlewares import (
+    DatabaseConnectionMiddleware,
     UserAutoRegisterMiddleware, 
     MandatorySubscriptionMiddleware,
     AdminAuthMiddleware,
     CallbackRateLimitMiddleware,
+    force_close_db_connections,
 )
-from apps.telegram_bot.customer.handlers import start, shop, wallet, orders, services, settings
+from apps.telegram_bot.customer.handlers import start, shop, wallet, orders, services, settings, referrals, support
 from apps.telegram_bot.admin import handlers as admin_handlers
 from apps.telegram_bot.admin_group import handlers as admin_group_handlers
+
 
 logger = logging.getLogger(__name__)
 
 async def global_error_handler(event: ErrorEvent):
-    """Catch unhandled errors, especially benign TelegramBadRequest (e.g. message is not modified)."""
+    """Catch unhandled errors, especially benign TelegramBadRequest (e.g. message is not modified) and DB dropped connections."""
     exception = event.exception
+    if isinstance(exception, (OperationalError, InterfaceError)):
+        logger.warning(f"Database connection error in global_error_handler ({exception}). Resetting connections...")
+        await sync_to_async(force_close_db_connections)()
+        return True
+
     if isinstance(exception, TelegramBadRequest):
-        if "message is not modified" in str(exception).lower():
+        msg = str(exception).lower()
+        if "query is too old" in msg or "message is not modified" in msg:
             if event.update and event.update.callback_query:
                 try:
-                    await event.update.callback_query.answer("📊 البيانات محدثة بالفعل")
+                    await event.update.callback_query.answer()
                 except Exception:
                     pass
             return True
@@ -49,6 +60,7 @@ class Command(BaseCommand):
         # Setup Customer Bot Dispatcher
         if customer_bot:
             cust_dp = Dispatcher()
+            cust_dp.update.outer_middleware(DatabaseConnectionMiddleware())
             cust_dp.error.register(global_error_handler)
             cust_dp.message.middleware(UserAutoRegisterMiddleware())
             cust_dp.callback_query.middleware(UserAutoRegisterMiddleware())
@@ -62,6 +74,9 @@ class Command(BaseCommand):
             cust_dp.include_router(orders.router)
             cust_dp.include_router(services.router)
             cust_dp.include_router(settings.router)
+            cust_dp.include_router(referrals.router)
+            cust_dp.include_router(support.router)
+
 
             tasks.append(cust_dp.start_polling(customer_bot, drop_pending_updates=True))
             self.stdout.write(self.style.SUCCESS("🤖 [1/2] Customer Bot dispatcher ready."))
@@ -71,6 +86,7 @@ class Command(BaseCommand):
         # Setup Admin Bot Dispatcher
         if admin_bot:
             admin_dp = Dispatcher()
+            admin_dp.update.outer_middleware(DatabaseConnectionMiddleware())
             admin_dp.error.register(global_error_handler)
             admin_dp.message.middleware(UserAutoRegisterMiddleware())
             admin_dp.callback_query.middleware(UserAutoRegisterMiddleware())

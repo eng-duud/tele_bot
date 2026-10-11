@@ -13,10 +13,11 @@ def get_customer_main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🛍 المتجر"), KeyboardButton(text="📂 الأقسام")],
             [KeyboardButton(text="💰 المحفظة"), KeyboardButton(text="📦 طلباتي")],
             [KeyboardButton(text="🛎 الخدمات"), KeyboardButton(text="👤 حسابي")],
-            [KeyboardButton(text="🎧 الدعم الفني")]
+            [KeyboardButton(text="🤝 الإحالات والأرباح"), KeyboardButton(text="🎧 الدعم الفني")]
         ],
         resize_keyboard=True
     )
+
 
 
 def get_categories_keyboard(categories: List[Category], parent_id: Optional[str] = None) -> InlineKeyboardMarkup:
@@ -41,9 +42,10 @@ def get_categories_keyboard(categories: List[Category], parent_id: Optional[str]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def get_products_keyboard(products: List[Product], category_id: str) -> InlineKeyboardMarkup:
-    """Product list inline keyboard for a category with actual stock quantity indicator."""
+def get_products_keyboard(products: List[Product], category_id: str, preferred_currency: str = 'YER') -> InlineKeyboardMarkup:
+    """Product list inline keyboard for a category with price in preferred currency."""
     from apps.catalog.services import CatalogService
+    from apps.core.services import CurrencyService
     buttons = []
     for prod in products:
         try:
@@ -63,7 +65,16 @@ def get_products_keyboard(products: List[Product], category_id: str) -> InlineKe
             stock_label = " (متوفر فوري)"
         else:
             stock_label = ""
-        buttons.append([InlineKeyboardButton(text=f"{badge} {prod.name}{stock_label}", callback_data=f"prod:{prod.id}")])
+
+        price_tag = ""
+        try:
+            p_yer = CatalogService.get_price_in_yer(prod)
+            p_str = CurrencyService.format_button_price(p_yer, preferred_currency)
+            price_tag = f" | {p_str}"
+        except Exception:
+            pass
+
+        buttons.append([InlineKeyboardButton(text=f"{badge} {prod.name}{stock_label}{price_tag}", callback_data=f"prod:{prod.id}")])
 
     buttons.append([
         InlineKeyboardButton(text="🔙 رجوع", callback_data="cat_root"),
@@ -92,9 +103,12 @@ def get_quantity_selector_keyboard(
     current_qty: int, 
     max_stock: int, 
     total_price_yer: float, 
-    has_sufficient_balance: bool
+    has_sufficient_balance: bool,
+    preferred_currency: str = 'YER'
 ) -> InlineKeyboardMarkup:
-    """Dynamic interactive keyboard for adjusting and confirming purchase quantity."""
+    """Dynamic interactive keyboard for adjusting and confirming purchase quantity in preferred currency."""
+    from decimal import Decimal
+    from apps.core.services import CurrencyService
     buttons = []
     
     minus_qty = max(1, current_qty - 1)
@@ -121,14 +135,15 @@ def get_quantity_selector_keyboard(
         InlineKeyboardButton(text="✍️ كتابة كمية مخصصة", callback_data=f"buy_custom_qty:{product_id}")
     ])
 
-    # Row 4: Confirm purchase
+    # Row 4: Confirm purchase formatted in user's preferred currency
+    price_btn_label = CurrencyService.format_button_price(Decimal(str(total_price_yer)), preferred_currency)
     if has_sufficient_balance:
         buttons.append([
-            InlineKeyboardButton(text=f"✅ تأكيد وشراء ({total_price_yer:,.0f} YER)", callback_data=f"buy_confirm:{product_id}:{current_qty}")
+            InlineKeyboardButton(text=f"✅ تأكيد وشراء ({price_btn_label})", callback_data=f"buy_confirm:{product_id}:{current_qty}")
         ])
     else:
         buttons.append([
-            InlineKeyboardButton(text=f"⚠️ الرصيد غير كافٍ ({total_price_yer:,.0f} YER)", callback_data="wallet_deposit")
+            InlineKeyboardButton(text=f"⚠️ الرصيد غير كافٍ ({price_btn_label})", callback_data="wallet_deposit")
         ])
 
     # Row 5: Back navigation
@@ -178,10 +193,11 @@ def get_admin_main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📊 لوحة التحكم والإحصائيات"), KeyboardButton(text="📥 طلبات الشحن المعلقة")],
-            [KeyboardButton(text="🛍 إدارة المنتجات"), KeyboardButton(text="📂 الأقسام والتصنيفات")],
-            [KeyboardButton(text="📦 إدارة المخزون المشفر"), KeyboardButton(text="📋 سجل وإدارة الطلبات")],
-            [KeyboardButton(text="💳 طرق الدفع والشحن"), KeyboardButton(text="👥 إدارة العملاء والأرصدة")],
-            [KeyboardButton(text="💵 أسعار الصرف والإعدادات"), KeyboardButton(text="📢 إذاعة وبث جماعي")],
+            [KeyboardButton(text="🛍 إدارة المنتجات"), KeyboardButton(text="🛠 إدارة الخدمات الرقمية")],
+            [KeyboardButton(text="📂 الأقسام والتصنيفات"), KeyboardButton(text="📦 إدارة المخزون المشفر")],
+            [KeyboardButton(text="📋 سجل وإدارة الطلبات"), KeyboardButton(text="💳 طرق الدفع والشحن")],
+            [KeyboardButton(text="👥 إدارة العملاء والأرصدة"), KeyboardButton(text="💵 أسعار الصرف والإعدادات")],
+            [KeyboardButton(text="📢 إذاعة وبث جماعي"), KeyboardButton(text="🔌 مزودو الـ API الخارجيون")],
             [KeyboardButton(text="📢 القنوات الإجبارية")]
         ],
         resize_keyboard=True

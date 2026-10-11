@@ -1,4 +1,6 @@
+import logging
 import re
+import html
 from decimal import Decimal
 from typing import List, Tuple, Optional
 from aiogram import Router, F
@@ -18,14 +20,18 @@ from apps.payments.models import PaymentRequest, PaymentMethod
 from apps.catalog.models import Product, Category
 from apps.inventory.models import StockItem
 from apps.inventory.services import InventoryService
-from apps.core.models import ExchangeRate
-from apps.core.services import CurrencyService
+from apps.core.models import ExchangeRate, SystemSetting
+from apps.core.services import CurrencyService, SystemSettingService
+from apps.core.backup_service import DatabaseBackupService
 from apps.fulfillment.models import OrderIssue
 from apps.notifications.models import RequiredChannel
 from apps.notifications.services import RestockNotifierService, ChannelSubscriptionService
+from apps.services_app.models import DigitalService, ServiceRequest
+from apps.providers.models import ApiProvider, ProviderProductMapping
+from apps.providers.services import ProviderDispatcherService
 from apps.wallet.models import Wallet, WalletTransaction
 from apps.wallet.services import WalletService
-from apps.telegram_bot.common.bot_instances import get_customer_bot
+from apps.telegram_bot.common.bot_instances import get_customer_bot, get_admin_bot
 from apps.telegram_bot.common.keyboards import get_admin_main_menu
 from apps.telegram_bot.common.states import (
     AdminExchangeRateStates, 
@@ -37,9 +43,14 @@ from apps.telegram_bot.common.states import (
     AdminEditProductPriceStates,
     AdminCustomerSearchStates,
     AdminManualWalletStates,
-    AdminAddChannelStates
+    AdminAddChannelStates,
+    AdminAddDigitalServiceStates,
+    AdminProvideQuoteStates,
+    AdminMapProductApiStates,
+    AdminSettingsStates
 )
 
+logger = logging.getLogger(__name__)
 router = Router()
 
 def get_admin_dashboard_markup() -> InlineKeyboardMarkup:
@@ -51,22 +62,26 @@ def get_admin_dashboard_markup() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="🛍 إدارة المنتجات", callback_data="adm_prods_list"),
-            InlineKeyboardButton(text="📂 الأقسام والتصنيفات", callback_data="adm_cats_list"),
+            InlineKeyboardButton(text="🛠 الخدمات الرقمية", callback_data="adm_services_list"),
         ],
         [
+            InlineKeyboardButton(text="📂 الأقسام والتصنيفات", callback_data="adm_cats_list"),
             InlineKeyboardButton(text="📦 المخزون المشفر", callback_data="adm_stock_menu"),
-            InlineKeyboardButton(text="📋 سجل وإدارة الطلبات", callback_data="adm_orders_list"),
         ],
         [
             InlineKeyboardButton(text="💳 طرق الدفع والشحن", callback_data="adm_paymethods_list"),
             InlineKeyboardButton(text="👥 إدارة العملاء والأرصدة", callback_data="adm_users_menu"),
         ],
         [
-            InlineKeyboardButton(text="💵 أسعار الصرف", callback_data="adm_rate_view"),
+            InlineKeyboardButton(text="⚙️ إعدادات المتجر والنظام", callback_data="adm_settings_view"),
             InlineKeyboardButton(text="📢 إذاعة وبث جماعي", callback_data="adm_broadcast_prompt"),
         ],
+
         [
             InlineKeyboardButton(text="📢 القنوات الإجبارية", callback_data="adm_channels_list"),
+            InlineKeyboardButton(text="🔌 مزودو الـ API", callback_data="adm_providers_list"),
+        ],
+        [
             InlineKeyboardButton(text="⚠️ المشاكل الفنية", callback_data="adm_issues_list"),
         ]
     ])
@@ -379,12 +394,12 @@ async def handle_products_list(event: Message | CallbackQuery):
 
 @router.callback_query(F.data.startswith("adm_prod_card:"))
 async def handle_product_card(callback: CallbackQuery):
-    """View full product details with edit price, toggle, restock, delete."""
+    """View full product details with edit price, toggle, restock, provider mapping, delete."""
     await callback.answer()
     prod_id = callback.data.split(":")[1]
 
     def get_prod_details():
-        p = Product.objects.prefetch_related('categories').filter(id=prod_id).first()
+        p = Product.objects.prefetch_related('categories').select_related('provider_mapping__provider').filter(id=prod_id).first()
         if not p:
             return None
         cats = ", ".join([c.name for c in p.categories.all()]) or "بدون قسم"
@@ -398,37 +413,58 @@ async def handle_product_card(callback: CallbackQuery):
         elif p.stock_type == 'API_CAPACITY':
             avail_stock = "مرتبط بمزود خارجي (API)"
         usd_price = CurrencyService.convert(p.price, from_curr='YER', to_curr='USD') if p.base_currency == 'YER' else p.price
-        return p, cats, avail_stock, usd_price
+        mapping = getattr(p, 'provider_mapping', None)
+        return p, cats, avail_stock, usd_price, mapping
 
     res = await sync_to_async(get_prod_details)()
     if not res:
         await callback.answer("المنتج غير موجود.", show_alert=True)
         return
 
-    prod, cats, avail_stock, usd_price = res
+    prod, cats, avail_stock, usd_price, mapping = res
     status_str = "🟢 مفعل ومتاح للعملاء" if prod.is_active else "🔴 معطل ومخفي"
     toggle_btn_text = "تعطيل المنتج 🔴" if prod.is_active else "تفعيل المنتج 🟢"
 
+    provider_info_html = ""
+    if mapping:
+        provider_info_html = (
+            f"🔌 <b>المزود الخارجي:</b> {html.escape(mapping.provider.name)} ({html.escape(mapping.provider.provider_code)})\n"
+            f"🆔 <b>معرف الخدمة لدى المزود:</b> <code>{html.escape(mapping.external_service_id)}</code>\n"
+        )
+    elif prod.stock_type == 'API_CAPACITY':
+        provider_info_html = "🔌 <b>المزود الخارجي:</b> ⚠️ <i>غير مربوط بمزود حتى الآن!</i>\n"
+
+    input_req_html = ""
+    if prod.requires_customer_input:
+        lbl = html.escape(prod.customer_input_label or "بيانات مطلوبة")
+        input_req_html = f"✍️ <b>مدخلات العميل:</b> نعم ({lbl})\n"
+    else:
+        input_req_html = "✍️ <b>مدخلات العميل:</b> غير مطلوبة (تلقائي)\n"
+
     text = (
-        f"🛍 *بطاقة المنتج:* *{prod.name}*\n"
+        f"🛍 <b>بطاقة المنتج:</b> <b>{html.escape(prod.name)}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"📂 القسم: *{cats}*\n"
-        f"💰 السعر: *{prod.price:,.0f} {prod.base_currency}* (${usd_price:,.2f} USD)\n"
-        f"⚡ الحالة: *{status_str}*\n"
-        f"📦 نوع المخزون: *{prod.get_stock_type_display()}*\n"
-        f"🔢 المتوفر حالياً: *{avail_stock}*\n"
-        f"🚀 طريقة التسليم: *{prod.get_fulfillment_type_display()}*\n"
-        f"📝 الوصف: {prod.description or 'لا يوجد وصف'}\n"
+        f"📂 القسم: <b>{html.escape(cats)}</b>\n"
+        f"💰 السعر: <b>{prod.price:,.0f} {prod.base_currency}</b> (${usd_price:,.2f} USD)\n"
+        f"⚡ الحالة: <b>{status_str}</b>\n"
+        f"📦 نوع المخزون: <b>{html.escape(prod.get_stock_type_display())}</b>\n"
+        f"🔢 المتوفر حالياً: <b>{avail_stock}</b>\n"
+        f"🚀 طريقة التسليم: <b>{html.escape(prod.get_fulfillment_type_display())}</b>\n"
+        f"{provider_info_html}"
+        f"{input_req_html}"
+        f"📝 الوصف: {html.escape(prod.description) if prod.description else 'لا يوجد وصف'}\n"
         f"━━━━━━━━━━━━━━━━━━"
     )
 
+    btn_api_text = "🔌 ربط بمزود خارجي (API)" if not mapping else f"🔌 إعدادات المزود ({mapping.provider.name[:12]}) ⚙️"
     buttons = [
         [InlineKeyboardButton(text="✏️ تعديل السعر", callback_data=f"adm_prod_editprice:{prod.id}"), InlineKeyboardButton(text=toggle_btn_text, callback_data=f"adm_prod_toggle:{prod.id}")],
+        [InlineKeyboardButton(text=btn_api_text, callback_data=f"adm_prod_map_api:{prod.id}")],
         [InlineKeyboardButton(text="📦 تعبئة وتحديث المخزون", callback_data=f"adm_add_stock:{prod.id}")],
         [InlineKeyboardButton(text="🗑️ حذف المنتج نهائياً", callback_data=f"adm_prod_delete:{prod.id}")],
         [InlineKeyboardButton(text="🔙 العودة لقائمة المنتجات", callback_data="adm_prods_list")]
     ]
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode='Markdown')
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode='HTML')
 
 
 @router.callback_query(F.data.startswith("adm_prod_toggle:"))
@@ -468,7 +504,10 @@ async def handle_product_delete(callback: CallbackQuery):
 
     name = await sync_to_async(delete_p)()
     if name:
-        await callback.answer(f"تم حذف المنتج ({name}) بنجاح!", show_alert=True)
+        try:
+            await callback.answer(f"تم حذف المنتج ({name}) بنجاح!", show_alert=True)
+        except Exception:
+            pass
     await handle_products_list(callback)
 
 
@@ -600,6 +639,40 @@ async def handle_prod_wiz_price_entered(message: Message, state: FSMContext):
 async def handle_prod_wiz_finish(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     stock_type = callback.data.split(":")[1]
+
+    if stock_type == 'API_CAPACITY':
+        # Route to external provider setup wizard
+        providers = await sync_to_async(list)(ApiProvider.objects.filter(is_active=True))
+        if not providers:
+            await callback.message.answer(
+                "⚠️ <b>لا يوجد أي مزود API خارجي مفعّل في النظام حالياً!</b>\n\n"
+                "يرجى أولاً إضافة أو تفعيل مزود خارجي (مثل Vente Bot)، أو اختيار نوع مخزون آخر.",
+                parse_mode='HTML'
+            )
+            return
+
+        await state.update_data(stock_type='API_CAPACITY', fulfillment_type='API')
+        await state.set_state(AdminAddProductStates.waiting_for_provider)
+
+        buttons = []
+        for prov in providers:
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"🌐 {prov.name} ({prov.provider_code})",
+                    callback_data=f"adm_wiz_prov:{prov.id}"
+                )
+            ])
+        buttons.append([InlineKeyboardButton(text="❌ إلغاء", callback_data="adm_prods_list")])
+
+        await callback.message.edit_text(
+            "🔌 <b>معالج إضافة منتج API (الخطوة 5.1/6):</b>\n\n"
+            "اختر <b>المزود الخارجي</b> الذي سيتم تنفيذ وشراء هذا المنتج من خلاله تلقائياً:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            parse_mode='HTML'
+        )
+        return
+
+    # Non-API stock types: Save product immediately
     data = await state.get_data()
     await state.clear()
 
@@ -607,7 +680,7 @@ async def handle_prod_wiz_finish(callback: CallbackQuery, state: FSMContext):
     name = data.get("prod_name")
     desc = data.get("prod_desc", "")
     price = Decimal(data.get("prod_price", "0"))
-    fulfillment_type = 'API' if stock_type == 'API_CAPACITY' else 'INVENTORY'
+    fulfillment_type = 'INVENTORY'
 
     def save_product():
         category = Category.objects.filter(id=cat_id).first()
@@ -633,14 +706,498 @@ async def handle_prod_wiz_finish(callback: CallbackQuery, state: FSMContext):
     ])
 
     await callback.message.edit_text(
-        f"🎉 *تمت إضافة المنتج بنجاح إلى قاعدة البيانات!* ✨\n\n"
-        f"🏷 الاسم: *{new_prod.name}*\n"
-        f"💰 السعر: *{new_prod.price:,.0f} YER*\n"
-        f"📦 المخزون: *{new_prod.get_stock_type_display()}*\n"
-        f"⚡ التسليم: *{new_prod.get_fulfillment_type_display()}*",
+        f"🎉 <b>تمت إضافة المنتج بنجاح إلى قاعدة البيانات!</b> ✨\n\n"
+        f"🏷 الاسم: <b>{html.escape(new_prod.name)}</b>\n"
+        f"💰 السعر: <b>{new_prod.price:,.0f} YER</b>\n"
+        f"📦 المخزون: <b>{html.escape(new_prod.get_stock_type_display())}</b>\n"
+        f"⚡ التسليم: <b>{html.escape(new_prod.get_fulfillment_type_display())}</b>",
         reply_markup=markup,
-        parse_mode='Markdown'
+        parse_mode='HTML'
     )
+
+
+# ---------------------------------------------------------
+# خطوات معالج إضافة منتج بمزود خارجي (API Provider Wizard)
+# ---------------------------------------------------------
+
+@router.callback_query(F.data.startswith("adm_wiz_prov:"), AdminAddProductStates.waiting_for_provider)
+async def handle_prod_wiz_provider_selected(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    prov_id = callback.data.split(":")[1]
+    provider = await sync_to_async(ApiProvider.objects.filter(id=prov_id).first)()
+    if not provider:
+        await callback.message.answer("⚠️ المزود المحدد غير موجود.", parse_mode='HTML')
+        return
+
+    await state.update_data(provider_id=prov_id, provider_name=provider.name)
+    await state.set_state(AdminAddProductStates.waiting_for_external_service_id)
+
+    await callback.message.edit_text(
+        f"🆔 <b>معالج إضافة منتج API (الخطوة 5.2/6):</b>\n\n"
+        f"المزود المختار: <b>{html.escape(provider.name)}</b>\n\n"
+        f"يرجى كتابة وإرسال <b>معرّف الخدمة أو كود المنتج (Service ID / SKU)</b> لدى هذا المزود:\n"
+        f"<i>(مثال: <code>pubg_60</code> أو <code>101</code> أو <code>freefire_100</code>)</i>:",
+        parse_mode='HTML'
+    )
+
+
+@router.message(AdminAddProductStates.waiting_for_external_service_id)
+async def handle_prod_wiz_service_id_entered(message: Message, state: FSMContext):
+    service_id = message.text.strip()
+    if not service_id:
+        await message.answer("⚠️ يرجى إدخال معرّف خدمة صحيح:")
+        return
+
+    await state.update_data(external_service_id=service_id)
+    await state.set_state(AdminAddProductStates.waiting_for_customer_input_label)
+
+    buttons = [
+        [InlineKeyboardButton(text="🎮 معرف اللاعب (Player ID)", callback_data="adm_wiz_input:player_id")],
+        [InlineKeyboardButton(text="🔗 رابط الحساب / المنشور (Link)", callback_data="adm_wiz_input:link")],
+        [InlineKeyboardButton(text="📱 رقم الهاتف / الحساب", callback_data="adm_wiz_input:phone")],
+        [InlineKeyboardButton(text="📧 البريد الإلكتروني (Email)", callback_data="adm_wiz_input:email")],
+        [InlineKeyboardButton(text="🚫 لا يتطلب أي بيانات من العميل", callback_data="adm_wiz_input:none")],
+    ]
+
+    await message.answer(
+        f"✍️ <b>معالج إضافة منتج API (الخطوة 5.3/6):</b>\n\n"
+        f"🆔 معرّف الخدمة: <code>{html.escape(service_id)}</code>\n\n"
+        f"<b>هل يتطلب هذا المنتج بيانات يدخلها العميل عند الشراء؟</b>\n"
+        f"<i>(مثال: شحن الألعاب يتطلب ID اللاعب، خدمات التواصل تتطلب رابط، إلخ)</i>\n\n"
+        f"اختر من النماذج الجاهزة أدناه، أو <b>اكتب نص الحقل المطلوب مباشرة</b> في رسالة:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode='HTML'
+    )
+
+
+async def _finalize_api_product_creation(target, state: FSMContext, requires_input: bool, input_label: str):
+    data = await state.get_data()
+    await state.clear()
+
+    cat_id = data.get("cat_id")
+    name = data.get("prod_name")
+    desc = data.get("prod_desc", "")
+    price = Decimal(data.get("prod_price", "0"))
+    provider_id = data.get("provider_id")
+    external_service_id = data.get("external_service_id")
+
+    def save_api_product():
+        category = Category.objects.filter(id=cat_id).first()
+        provider = ApiProvider.objects.filter(id=provider_id).first()
+        prod = Product.objects.create(
+            name=name,
+            description=desc,
+            price=price,
+            base_currency='YER',
+            stock_type='API_CAPACITY',
+            fulfillment_type='API',
+            requires_customer_input=requires_input,
+            customer_input_label=input_label if requires_input else "",
+            is_active=True
+        )
+        if category:
+            prod.categories.add(category)
+
+        if provider:
+            ProviderProductMapping.objects.create(
+                product=prod,
+                provider=provider,
+                external_service_id=external_service_id
+            )
+        return prod, provider
+
+    prod, provider = await sync_to_async(save_api_product)()
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛍 بطاقة المنتج", callback_data=f"adm_prod_card:{prod.id}")],
+        [InlineKeyboardButton(text="➕ إضافة منتج آخر", callback_data="adm_prod_add_step1")],
+        [InlineKeyboardButton(text="🏠 الرئيسية", callback_data="adm_home")]
+    ])
+
+    prov_name = provider.name if provider else "مزود خارجي"
+    cust_input_str = f"نعم ({html.escape(input_label)})" if requires_input else "غير مطلوبة (شراء تلقائي مباشر)"
+
+    success_msg = (
+        f"🎉 <b>تم إنشاء وربط المنتج بالمزود بنجاح!</b> ⚡\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🛍 <b>الاسم:</b> <b>{html.escape(prod.name)}</b>\n"
+        f"💰 <b>السعر:</b> <b>{prod.price:,.0f} YER</b>\n"
+        f"🔌 <b>المزود المربوط:</b> {html.escape(prov_name)}\n"
+        f"🆔 <b>معرف الخدمة لدى المزود:</b> <code>{html.escape(external_service_id)}</code>\n"
+        f"✍️ <b>مدخلات العميل:</b> {cust_input_str}\n"
+        f"🚀 <b>طريقة التسليم:</b> شراء فوري وتلقائي عبر API المزود\n"
+        f"━━━━━━━━━━━━━━━━━━"
+    )
+
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(success_msg, reply_markup=markup, parse_mode='HTML')
+    else:
+        await target.answer(success_msg, reply_markup=markup, parse_mode='HTML')
+
+
+@router.callback_query(F.data.startswith("adm_wiz_input:"), AdminAddProductStates.waiting_for_customer_input_label)
+async def handle_prod_wiz_input_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    preset = callback.data.split(":")[1]
+    presets_map = {
+        'player_id': (True, "معرف اللاعب (Player ID)"),
+        'link': (True, "رابط الحساب أو المنشور"),
+        'phone': (True, "رقم الهاتف / الحساب"),
+        'email': (True, "البريد الإلكتروني"),
+        'none': (False, ""),
+    }
+    req, lbl = presets_map.get(preset, (False, ""))
+    await _finalize_api_product_creation(callback, state, req, lbl)
+
+
+@router.message(AdminAddProductStates.waiting_for_customer_input_label)
+async def handle_prod_wiz_input_message(message: Message, state: FSMContext):
+    txt = message.text.strip()
+    if txt.lower() in ("لا", "بدون", "لا يوجد", "none", "-", "0"):
+        req = False
+        lbl = ""
+    else:
+        req = True
+        lbl = txt
+    await _finalize_api_product_creation(message, state, req, lbl)
+
+
+# ---------------------------------------------------------
+# ربط / تعديل المزود لمنتج موجود مسبقاً (Map Existing Product)
+# ---------------------------------------------------------
+
+@router.callback_query(F.data.startswith("adm_prod_map_api:"))
+async def handle_prod_map_api_start(callback: CallbackQuery, state: FSMContext):
+    """Start wizard to map an existing product to an external API provider."""
+    await callback.answer()
+    prod_id = callback.data.split(":")[1]
+
+    def get_prod_and_mapping():
+        p = Product.objects.filter(id=prod_id).first()
+        if not p:
+            return None, None
+        m = ProviderProductMapping.objects.filter(product=p).select_related('provider').first()
+        return p, m
+
+    prod, mapping = await sync_to_async(get_prod_and_mapping)()
+    if not prod:
+        await callback.answer("المنتج غير موجود.", show_alert=True)
+        return
+
+    providers = await sync_to_async(list)(ApiProvider.objects.filter(is_active=True))
+    if not providers:
+        await callback.message.answer(
+            "⚠️ <b>لا يوجد أي مزود API خارجي مفعّل في النظام حالياً!</b>",
+            parse_mode='HTML'
+        )
+        return
+
+    await state.update_data(map_prod_id=str(prod.id))
+    await state.set_state(AdminMapProductApiStates.waiting_for_provider)
+
+    buttons = []
+    for prov in providers:
+        is_cur = " (الحالي ✅)" if mapping and mapping.provider_id == prov.id else ""
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"🌐 {prov.name} ({prov.provider_code}){is_cur}",
+                callback_data=f"adm_map_prov:{prov.id}"
+            )
+        ])
+
+    if mapping:
+        buttons.append([
+            InlineKeyboardButton(text="🔓 فك الارتباط بالمزود (تحويل لمخزون عادي)", callback_data=f"adm_map_unlink:{prod.id}")
+        ])
+
+    buttons.append([InlineKeyboardButton(text="🔙 العودة لبطاقة المنتج", callback_data=f"adm_prod_card:{prod.id}")])
+
+    cur_status = f"المزود الحالي: <b>{html.escape(mapping.provider.name)}</b> (ID: <code>{html.escape(mapping.external_service_id)}</code>)" if mapping else "المنتج غير مربوط بأي مزود حالياً."
+
+    await callback.message.edit_text(
+        f"🔌 <b>ربط وتحديث مزود الـ API للمنتج:</b>\n"
+        f"🛍 <b>{html.escape(prod.name)}</b>\n\n"
+        f"📌 {cur_status}\n\n"
+        f"اختر المزود الذي تود ربط المنتج به:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode='HTML'
+    )
+
+
+@router.callback_query(F.data.startswith("adm_map_unlink:"))
+async def handle_prod_map_unlink(callback: CallbackQuery, state: FSMContext):
+    """Unlink product from external provider."""
+    await callback.answer()
+    await state.clear()
+    prod_id = callback.data.split(":")[1]
+
+    def unlink():
+        p = Product.objects.filter(id=prod_id).first()
+        if p:
+            ProviderProductMapping.objects.filter(product=p).delete()
+            p.stock_type = 'QUANTITY'
+            p.fulfillment_type = 'INVENTORY'
+            p.requires_customer_input = False
+            p.customer_input_label = ""
+            p.save(update_fields=['stock_type', 'fulfillment_type', 'requires_customer_input', 'customer_input_label', 'updated_at'])
+            return p.name
+        return None
+
+    name = await sync_to_async(unlink)()
+    if name:
+        await callback.answer("✅ تم فك ارتباط المنتج بالمزود وتحويله لمخزون داخلي.", show_alert=True)
+    await handle_product_card(callback)
+
+
+@router.callback_query(F.data.startswith("adm_map_prov:"), AdminMapProductApiStates.waiting_for_provider)
+async def handle_prod_map_prov_selected(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    prov_id = callback.data.split(":")[1]
+    provider = await sync_to_async(ApiProvider.objects.filter(id=prov_id).first)()
+    if not provider:
+        await callback.message.answer("⚠️ المزود المحدد غير موجود.", parse_mode='HTML')
+        return
+
+    await state.update_data(provider_id=prov_id, provider_name=provider.name)
+    await state.set_state(AdminMapProductApiStates.waiting_for_external_service_id)
+
+    await callback.message.edit_text(
+        f"🆔 <b>ربط مزود الـ API (الخطوة 2/3):</b>\n\n"
+        f"المزود المختار: <b>{html.escape(provider.name)}</b>\n\n"
+        f"يرجى كتابة وإرسال <b>معرّف الخدمة أو كود المنتج (Service ID / SKU)</b> لدى هذا المزود:\n"
+        f"<i>(مثال: <code>pubg_60</code> أو <code>101</code> أو <code>netflix_1m</code>)</i>:",
+        parse_mode='HTML'
+    )
+
+
+@router.message(AdminMapProductApiStates.waiting_for_external_service_id)
+async def handle_prod_map_service_id_entered(message: Message, state: FSMContext):
+    service_id = message.text.strip()
+    if not service_id:
+        await message.answer("⚠️ يرجى إدخال معرّف خدمة صحيح:")
+        return
+
+    await state.update_data(external_service_id=service_id)
+    await state.set_state(AdminMapProductApiStates.waiting_for_customer_input_label)
+
+    buttons = [
+        [InlineKeyboardButton(text="🎮 معرف اللاعب (Player ID)", callback_data="adm_map_input:player_id")],
+        [InlineKeyboardButton(text="🔗 رابط الحساب / المنشور (Link)", callback_data="adm_map_input:link")],
+        [InlineKeyboardButton(text="📱 رقم الهاتف / الحساب", callback_data="adm_map_input:phone")],
+        [InlineKeyboardButton(text="📧 البريد الإلكتروني (Email)", callback_data="adm_map_input:email")],
+        [InlineKeyboardButton(text="🚫 لا يتطلب أي بيانات من العميل", callback_data="adm_map_input:none")],
+    ]
+
+    await message.answer(
+        f"✍️ <b>ربط مزود الـ API (الخطوة 3/3):</b>\n\n"
+        f"🆔 معرّف الخدمة: <code>{html.escape(service_id)}</code>\n\n"
+        f"<b>هل يتطلب هذا المنتج بيانات يدخلها العميل عند الشراء؟</b>\n"
+        f"اختر من الخيارات السريعة، أو <b>اكتب التسمية مباشرة</b> في رسالة:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode='HTML'
+    )
+
+
+async def _finalize_existing_product_mapping(target, state: FSMContext, requires_input: bool, input_label: str):
+    data = await state.get_data()
+    await state.clear()
+
+    prod_id = data.get("map_prod_id")
+    provider_id = data.get("provider_id")
+    external_service_id = data.get("external_service_id")
+
+    def save_mapping():
+        p = Product.objects.filter(id=prod_id).first()
+        provider = ApiProvider.objects.filter(id=provider_id).first()
+        if not p or not provider:
+            return None, None
+
+        p.stock_type = 'API_CAPACITY'
+        p.fulfillment_type = 'API'
+        p.requires_customer_input = requires_input
+        p.customer_input_label = input_label if requires_input else ""
+        p.save(update_fields=['stock_type', 'fulfillment_type', 'requires_customer_input', 'customer_input_label', 'updated_at'])
+
+        mapping, _ = ProviderProductMapping.objects.update_or_create(
+            product=p,
+            defaults={
+                'provider': provider,
+                'external_service_id': external_service_id
+            }
+        )
+        return p, provider
+
+    prod, provider = await sync_to_async(save_mapping)()
+    if not prod:
+        msg = "⚠️ حدث خطأ أثناء حفظ الربط، المنتج غير موجود."
+        if isinstance(target, CallbackQuery):
+            await target.message.answer(msg)
+        else:
+            await target.answer(msg)
+        return
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛍 العودة لبطاقة المنتج", callback_data=f"adm_prod_card:{prod.id}")],
+        [InlineKeyboardButton(text="📋 قائمة المنتجات", callback_data="adm_prods_list")],
+        [InlineKeyboardButton(text="🏠 الرئيسية", callback_data="adm_home")]
+    ])
+
+    cust_input_str = f"نعم ({html.escape(input_label)})" if requires_input else "غير مطلوبة"
+
+    text = (
+        f"✅ <b>تم تحديث ربط المنتج بالمزود الخارجي بنجاح!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🛍 <b>المنتج:</b> <b>{html.escape(prod.name)}</b>\n"
+        f"🔌 <b>المزود:</b> {html.escape(provider.name)}\n"
+        f"🆔 <b>معرف الخدمة:</b> <code>{html.escape(external_service_id)}</code>\n"
+        f"✍️ <b>مدخلات العميل:</b> {cust_input_str}\n"
+        f"⚡ <b>نوع التسليم:</b> شراء فوري عبر API المزود\n"
+        f"━━━━━━━━━━━━━━━━━━"
+    )
+
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=markup, parse_mode='HTML')
+    else:
+        await target.answer(text, reply_markup=markup, parse_mode='HTML')
+
+
+@router.callback_query(F.data.startswith("adm_map_input:"), AdminMapProductApiStates.waiting_for_customer_input_label)
+async def handle_prod_map_input_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    preset = callback.data.split(":")[1]
+    presets_map = {
+        'player_id': (True, "معرف اللاعب (Player ID)"),
+        'link': (True, "رابط الحساب أو المنشور"),
+        'phone': (True, "رقم الهاتف / الحساب"),
+        'email': (True, "البريد الإلكتروني"),
+        'none': (False, ""),
+    }
+    req, lbl = presets_map.get(preset, (False, ""))
+    await _finalize_existing_product_mapping(callback, state, req, lbl)
+
+
+@router.message(AdminMapProductApiStates.waiting_for_customer_input_label)
+async def handle_prod_map_input_message(message: Message, state: FSMContext):
+    txt = message.text.strip()
+    if txt.lower() in ("لا", "بدون", "لا يوجد", "none", "-", "0"):
+        req = False
+        lbl = ""
+    else:
+        req = True
+        lbl = txt
+    await _finalize_existing_product_mapping(message, state, req, lbl)
+
+
+# ---------------------------------------------------------
+# قائمة وإدارة مزودي الـ API في لوحة التحكم (Providers List)
+# ---------------------------------------------------------
+
+@router.callback_query(F.data == "adm_providers_list")
+@router.message(F.text == "🔌 مزودو الـ API الخارجيون")
+async def handle_admin_providers_list(event: Message | CallbackQuery):
+    """View and manage external API providers, their status, balance, and mapped products."""
+    if isinstance(event, CallbackQuery):
+        await event.answer()
+        target = event.message
+    else:
+        target = event
+
+    def get_providers_data():
+        providers = list(ApiProvider.objects.all())
+        results = []
+        for p in providers:
+            mapped_count = p.product_mappings.count()
+            results.append((p, mapped_count))
+        return results
+
+    providers_data = await sync_to_async(get_providers_data)()
+
+    if not providers_data:
+        text = (
+            "🔌 <b>مزودو الـ API الخارجيون</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "⚠️ لا يوجد أي مزود معرف في النظام حتى الآن."
+        )
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 الرئيسية", callback_data="adm_home")]
+        ])
+    else:
+        text_lines = [
+            "🔌 <b>إدارة مزودي الـ API الخارجيين:</b>",
+            "━━━━━━━━━━━━━━━━━━"
+        ]
+        buttons = []
+        for prov, mapped_cnt in providers_data:
+            st_icon = "🟢" if prov.is_active else "🔴"
+            st_text = "نشط" if prov.is_active else "معطل"
+            text_lines.append(
+                f"{st_icon} <b>{html.escape(prov.name)}</b> (<code>{html.escape(prov.provider_code)}</code>)\n"
+                f"   ⚡ النوع: {prov.get_provider_type_display()}\n"
+                f"   📦 المنتجات المربوطة: <b>{mapped_cnt} منتج</b>\n"
+                f"   🌐 الرابط: <code>{html.escape(prov.base_url or 'افتراضي')}</code>"
+            )
+            buttons.append([
+                InlineKeyboardButton(text=f"💰 رصيد {prov.name[:12]}", callback_data=f"adm_prov_bal:{prov.id}"),
+                InlineKeyboardButton(text=f"{st_icon} {st_text}", callback_data=f"adm_prov_toggle:{prov.id}")
+            ])
+        text_lines.append("━━━━━━━━━━━━━━━━━━")
+        buttons.append([InlineKeyboardButton(text="🏠 الرئيسية", callback_data="adm_home")])
+        text = "\n".join(text_lines)
+        markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    if isinstance(event, CallbackQuery):
+        await target.edit_text(text, reply_markup=markup, parse_mode='HTML')
+    else:
+        await target.answer(text, reply_markup=markup, parse_mode='HTML')
+
+
+@router.callback_query(F.data.startswith("adm_prov_bal:"))
+async def handle_admin_provider_balance(callback: CallbackQuery):
+    """Check live wallet balance at external API provider."""
+    await callback.answer("⏳ جاري الاستعلام عن الرصيد من المزود...", show_alert=False)
+    prov_id = callback.data.split(":")[1]
+
+    def check_bal():
+        prov = ApiProvider.objects.filter(id=prov_id).first()
+        if not prov:
+            return None, "المزود غير موجود"
+        try:
+            adapter = ProviderDispatcherService.get_adapter(prov)
+            bal = adapter.get_balance()
+            return prov, bal
+        except Exception as e:
+            return prov, f"خطأ: {e}"
+
+    prov, bal_result = await sync_to_async(check_bal)()
+    if not prov:
+        await callback.answer("المزود غير موجود.", show_alert=True)
+        return
+
+    await callback.answer(
+        f"💰 رصيدك لدى {prov.name}:\n{bal_result}",
+        show_alert=True
+    )
+
+
+@router.callback_query(F.data.startswith("adm_prov_toggle:"))
+async def handle_admin_provider_toggle(callback: CallbackQuery):
+    """Toggle provider active status."""
+    await callback.answer()
+    prov_id = callback.data.split(":")[1]
+
+    def toggle_prov():
+        p = ApiProvider.objects.filter(id=prov_id).first()
+        if p:
+            p.is_active = not p.is_active
+            p.save(update_fields=['is_active', 'updated_at'])
+            return p
+        return None
+
+    p = await sync_to_async(toggle_prov)()
+    if p:
+        st = "مفعّل 🟢" if p.is_active else "معطّل 🔴"
+        await callback.answer(f"تم تغيير حالة المزود إلى {st}", show_alert=True)
+    await handle_admin_providers_list(callback)
 
 
 # ==============================================================================
@@ -1477,12 +2034,12 @@ async def handle_admin_deposit_view(callback: CallbackQuery):
 
 
 # ==============================================================================
-# 8. أسعار الصرف (Exchange Rates)
+# 8. إعدادات المتجر والنظام وأسعار الصرف (Store Settings & SaaS Configuration)
 # ==============================================================================
-@router.callback_query(F.data == "adm_rate_view")
-@router.message(F.text == "💵 أسعار الصرف والإعدادات")
-async def handle_admin_exchange_rate(event: Message | CallbackQuery):
-    """View and update USD to YER exchange rate."""
+@router.callback_query(F.data.in_(["adm_settings_view", "adm_rate_view"]))
+@router.message(F.text.in_(["⚙️ إعدادات المتجر والنظام", "💵 أسعار الصرف والإعدادات"]))
+async def handle_admin_settings_view(event: Message | CallbackQuery):
+    """View and manage dynamic SaaS system settings, store branding, and exchange rates."""
     user_id = event.from_user.id
     is_admin = await sync_to_async(AdminAuthService.is_admin)(user_id)
     if not is_admin:
@@ -1495,34 +2052,396 @@ async def handle_admin_exchange_rate(event: Message | CallbackQuery):
         target = event
 
     rate = await sync_to_async(ExchangeRate.get_usd_to_yer_rate)()
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ تعديل سعر الصرف الآن", callback_data="adm_edit_rate")],
-        [InlineKeyboardButton(text="🏠 الرئيسية", callback_data="adm_home")]
-    ])
+    base_curr = await sync_to_async(CurrencyService.get_base_currency)()
+    store_name = await sync_to_async(SystemSettingService.get_setting)('STORE_NAME', 'المتجر الرقمي')
+    support_user = await sync_to_async(SystemSettingService.get_setting)('SUPPORT_USERNAME', '')
+    ref_bonus = await sync_to_async(SystemSettingService.get_decimal)('REFERRAL_BONUS_YER', Decimal('50.00'))
+    ref_enabled = await sync_to_async(SystemSettingService.get_bool)('REFERRAL_ENABLED', True)
+    success_ch_id = await sync_to_async(SystemSettingService.get_setting)('SUCCESS_CHANNEL_ID', '@duudsuccess')
+    success_enabled = await sync_to_async(SystemSettingService.get_bool)('SUCCESS_CHANNEL_ENABLED', True)
+    mand_sub_enabled = await sync_to_async(SystemSettingService.get_bool)('MANDATORY_SUBSCRIPTION_ENABLED', True)
+    backup_ch_id = await sync_to_async(SystemSettingService.get_setting)('BACKUP_CHANNEL_ID', '')
+    backup_enabled = await sync_to_async(SystemSettingService.get_bool)('BACKUP_AUTO_ENABLED', True)
+
+    support_display = f"@{support_user.lstrip('@')}" if support_user else "غير محدد (مفتوح للتذاكر فقط)"
+    ref_status = "🟢 مفعّل" if ref_enabled else "🔴 معطّل"
+    success_status = "🟢 مفعّل" if success_enabled else "🔴 معطّل"
+    mand_status = "🟢 إجباري" if mand_sub_enabled else "⚪ اختياري (معطّل)"
+    backup_status = "🟢 مفعّل" if backup_enabled else "🔴 معطّل"
+    backup_display = backup_ch_id if backup_ch_id else "حساب المالك الافتراضي"
+    curr_label = "🇾🇪 ريال يمني (YER)" if base_curr == 'YER' else "🇺🇸 دولار أمريكي (USD)"
 
     text = (
-        f"💵 *سعر صرف الدولار المعتمد في المتجر:*\n"
+        f"⚙️ <b>لوحة إعدادات النظام والمتجر (SaaS Settings)</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"💵 *1 USD = {rate:,.2f} YER*\n"
+        f"🏷️ <b>اسم المتجر:</b> <code>{html.escape(store_name)}</code>\n"
+        f"💱 <b>العملة الرسمية للمتجر:</b> <b>{curr_label}</b>\n"
+        f"💵 <b>سعر الصرف المعتمد:</b> <b>1 USD = {rate:,.2f} YER</b>\n"
+        f"📢 <b>قناة التفعيلات:</b> <code>{html.escape(success_ch_id or 'غير محددة')}</code> ({success_status})\n"
+        f"🔒 <b>الاشتراك الإجباري:</b> {mand_status}\n"
+        f"📦 <b>قناة النسخ الاحتياطي:</b> <code>{html.escape(backup_display)}</code> ({backup_status})\n"
+        f"🎧 <b>يوزر الدعم الفني:</b> <code>{html.escape(support_display)}</code>\n"
+        f"🤝 <b>مكافأة الإحالة:</b> <b>{ref_bonus:,.0f} YER</b> ({ref_status})\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"أي تعديل على هذا الرقم ينعكس فورياً ولحظياً على جميع أسعار المنتجات المحسوبة بالدولار."
+        f"اختر الإعداد الذي ترغب بتهيئته أو تعديله:"
     )
 
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="💵 تعديل سعر الصرف", callback_data="adm_edit_rate"),
+            InlineKeyboardButton(text=f"💱 تحويل العملة إلى {'USD' if base_curr == 'YER' else 'YER'}", callback_data="adm_toggle_base_currency"),
+        ],
+        [
+            InlineKeyboardButton(text="📢 إعدادات قناة التفعيلات", callback_data="adm_success_ch_view"),
+            InlineKeyboardButton(text="🔒 قنوات الاشتراك الإجباري", callback_data="adm_channels_list"),
+        ],
+        [
+            InlineKeyboardButton(text="📦 إعدادات النسخ الاحتياطي للبيانات", callback_data="adm_backup_view"),
+        ],
+        [
+            InlineKeyboardButton(text="🏷️ تعديل اسم المتجر", callback_data="adm_edit_store_name"),
+            InlineKeyboardButton(text="🎧 تعديل يوزر الدعم", callback_data="adm_edit_support_user"),
+        ],
+        [
+            InlineKeyboardButton(text="🤝 تعديل مكافأة الإحالة", callback_data="adm_edit_ref_bonus"),
+            InlineKeyboardButton(text=f"🔄 {'تعطيل' if ref_enabled else 'تفعيل'} نظام الإحالات", callback_data="adm_toggle_referral"),
+        ],
+        [
+            InlineKeyboardButton(text="🏠 الرئيسية", callback_data="adm_home")
+        ]
+    ])
+
     if isinstance(event, CallbackQuery):
-        await target.edit_text(text, reply_markup=markup, parse_mode='Markdown')
+        await target.edit_text(text, reply_markup=markup, parse_mode='HTML')
     else:
-        await target.answer(text, reply_markup=markup, parse_mode='Markdown')
+        await target.answer(text, reply_markup=markup, parse_mode='HTML')
+
+
+@router.callback_query(F.data == "adm_toggle_base_currency")
+async def handle_toggle_base_currency(callback: CallbackQuery):
+    """Toggle official base currency between YER and USD."""
+    current = await sync_to_async(CurrencyService.get_base_currency)()
+    new_curr = 'USD' if current == 'YER' else 'YER'
+    await sync_to_async(CurrencyService.set_base_currency)(new_curr)
+    curr_name = "الدولار الأمريكي (USD)" if new_curr == 'USD' else "الريال اليمني (YER)"
+    await callback.answer(f"✅ تم تغيير العملة الرسمية للمتجر إلى: {curr_name} بنجاح!", show_alert=True)
+    await handle_admin_settings_view(callback)
+
+
+@router.callback_query(F.data == "adm_success_ch_view")
+async def handle_success_channel_view(callback: CallbackQuery):
+    """View and manage success/activations channel settings."""
+    await callback.answer()
+    ch_id = await sync_to_async(SystemSettingService.get_setting)('SUCCESS_CHANNEL_ID', '@duudsuccess')
+    ch_title = await sync_to_async(SystemSettingService.get_setting)('SUCCESS_CHANNEL_TITLE', 'قناة التفعيلات المباشرة')
+    ch_url = await sync_to_async(SystemSettingService.get_setting)('SUCCESS_CHANNEL_URL', 'https://t.me/duudsuccess')
+    is_enabled = await sync_to_async(SystemSettingService.get_bool)('SUCCESS_CHANNEL_ENABLED', True)
+
+    status_text = "🟢 مفعّل (يتم النشر تلقائياً)" if is_enabled else "🔴 معطّل (النشر متوقف)"
+
+    text = (
+        f"📢 <b>إعدادات قناة التفعيلات الناجحة (Success Channel)</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 <b>معرف القناة:</b> <code>{html.escape(ch_id or 'غير محدد')}</code>\n"
+        f"🏷️ <b>اسم القناة:</b> <b>{html.escape(ch_title)}</b>\n"
+        f"🔗 <b>رابط القناة:</b> <code>{html.escape(ch_url or 'لا يوجد')}</code>\n"
+        f"⚡ <b>حالة النشر:</b> <b>{status_text}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"<i>ملاحظة: تأكد من إضافة بوت المتجر كمشرف في القناة ولديه صلاحية نشر الرسائل.</i>"
+    )
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=f"🔄 {'تعطيل' if is_enabled else 'تفعيل'} النشر التلقائي", callback_data="adm_toggle_success_ch"),
+        ],
+        [
+            InlineKeyboardButton(text="🆔 تعديل معرف القناة (ID/@)", callback_data="adm_edit_success_ch_id"),
+            InlineKeyboardButton(text="🏷️ تعديل اسم القناة", callback_data="adm_edit_success_ch_title"),
+        ],
+        [
+            InlineKeyboardButton(text="🔗 تعديل رابط القناة", callback_data="adm_edit_success_ch_url"),
+            InlineKeyboardButton(text="🧪 فحص إرسال تجريبي", callback_data="adm_test_success_ch"),
+        ],
+        [
+            InlineKeyboardButton(text="⚙️ العودة للإعدادات", callback_data="adm_settings_view"),
+            InlineKeyboardButton(text="🏠 الرئيسية", callback_data="adm_home"),
+        ]
+    ])
+
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode='HTML')
+
+
+@router.callback_query(F.data == "adm_toggle_success_ch")
+async def handle_toggle_success_channel(callback: CallbackQuery):
+    """Toggle success channel broadcasting."""
+    current = await sync_to_async(SystemSettingService.get_bool)('SUCCESS_CHANNEL_ENABLED', True)
+    new_state = "false" if current else "true"
+    await sync_to_async(SystemSettingService.set_setting)('SUCCESS_CHANNEL_ENABLED', new_state, "تفعيل/تعطيل النشر في قناة التفعيلات")
+    await callback.answer(f"تم {'تعطيل' if current else 'تفعيل'} النشر التلقائي بنجاح!")
+    await handle_success_channel_view(callback)
+
+
+@router.callback_query(F.data == "adm_edit_success_ch_id")
+async def handle_prompt_success_ch_id(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(AdminSettingsStates.waiting_for_success_channel_id)
+    await callback.message.answer(
+        "✍️ اكتب وأرسل <b>معرف قناة التفعيلات الجديد</b> (مثال: <code>@duudsuccess</code> أو <code>-1004496030171</code>):\n"
+        "<i>(أو اكتب إلغاء للتراجع)</i>",
+        parse_mode='HTML'
+    )
+
+
+@router.message(AdminSettingsStates.waiting_for_success_channel_id)
+async def handle_save_success_ch_id(message: Message, state: FSMContext):
+    txt = message.text.strip()
+    if txt.lower() in ("/cancel", "إلغاء", "الغاء"):
+        await state.clear()
+        await message.answer("❌ تم الإلغاء.")
+        return
+
+    await state.clear()
+    await sync_to_async(SystemSettingService.set_setting)('SUCCESS_CHANNEL_ID', txt, "معرف قناة التفعيلات الناجحة")
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 العودة لقناة التفعيلات", callback_data="adm_success_ch_view")],
+        [InlineKeyboardButton(text="⚙️ العودة للإعدادات", callback_data="adm_settings_view")]
+    ])
+    await message.answer(f"✅ تم تحديث معرف قناة التفعيلات إلى: <code>{html.escape(txt)}</code>", reply_markup=markup, parse_mode='HTML')
+
+
+@router.callback_query(F.data == "adm_edit_success_ch_title")
+async def handle_prompt_success_ch_title(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(AdminSettingsStates.waiting_for_success_channel_title)
+    await callback.message.answer("✍️ اكتب وأرسل <b>اسم قناة التفعيلات</b> (مثال: قناة التفعيلات والعمليات الناجحة):", parse_mode='HTML')
+
+
+@router.message(AdminSettingsStates.waiting_for_success_channel_title)
+async def handle_save_success_ch_title(message: Message, state: FSMContext):
+    txt = message.text.strip()
+    if txt.lower() in ("/cancel", "إلغاء", "الغاء"):
+        await state.clear()
+        await message.answer("❌ تم الإلغاء.")
+        return
+
+    await state.clear()
+    await sync_to_async(SystemSettingService.set_setting)('SUCCESS_CHANNEL_TITLE', txt, "اسم قناة التفعيلات")
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 العودة لقناة التفعيلات", callback_data="adm_success_ch_view")],
+        [InlineKeyboardButton(text="⚙️ العودة للإعدادات", callback_data="adm_settings_view")]
+    ])
+    await message.answer(f"✅ تم حفظ اسم قناة التفعيلات: <b>{html.escape(txt)}</b>", reply_markup=markup, parse_mode='HTML')
+
+
+@router.callback_query(F.data == "adm_edit_success_ch_url")
+async def handle_prompt_success_ch_url(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(AdminSettingsStates.waiting_for_success_channel_url)
+    await callback.message.answer("✍️ اكتب وأرسل <b>رابط قناة التفعيلات</b> (مثال: <code>https://t.me/duudsuccess</code>):", parse_mode='HTML')
+
+
+@router.message(AdminSettingsStates.waiting_for_success_channel_url)
+async def handle_save_success_ch_url(message: Message, state: FSMContext):
+    txt = message.text.strip()
+    if txt.lower() in ("/cancel", "إلغاء", "الغاء"):
+        await state.clear()
+        await message.answer("❌ تم الإلغاء.")
+        return
+
+    await state.clear()
+    await sync_to_async(SystemSettingService.set_setting)('SUCCESS_CHANNEL_URL', txt, "رابط قناة التفعيلات")
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 العودة لقناة التفعيلات", callback_data="adm_success_ch_view")],
+        [InlineKeyboardButton(text="⚙️ العودة للإعدادات", callback_data="adm_settings_view")]
+    ])
+    await message.answer(f"✅ تم حفظ رابط قناة التفعيلات: <code>{html.escape(txt)}</code>", reply_markup=markup, parse_mode='HTML')
+
+
+@router.callback_query(F.data == "adm_test_success_ch")
+async def handle_test_success_channel(callback: CallbackQuery):
+    """Test send message to verify bot admin rights in success channel."""
+    await callback.answer("⏳ جاري الفحص والإرسال للقناة...")
+    ch_id = await sync_to_async(SystemSettingService.get_setting)('SUCCESS_CHANNEL_ID', '')
+    if not ch_id:
+        await callback.message.answer("⚠️ لم يتم تعيين معرف قناة التفعيلات بعد!")
+        return
+
+    bot = callback.bot
+    try:
+        sent = await bot.send_message(
+            chat_id=ch_id,
+            text="🧪 <b>رسالة فحص تجريبية من لوحة الإدارة</b> ✅\nالبوت متصل بالقناة بنجاح ولديه صلاحيات المشرف الكاملة.",
+            parse_mode='HTML'
+        )
+        await callback.message.answer(
+            f"✅ <b>نجح الإرسال للقناة!</b>\n"
+            f"معرف القناة: <code>{html.escape(ch_id)}</code>\n"
+            f"معرف الرسالة المرسلة: <code>{sent.message_id}</code>\n\n"
+            f"تم التحقق بنجاح من أن البوت مشرف في القناة.",
+            parse_mode='HTML'
+        )
+    except Exception as e:
+        await callback.message.answer(
+            f"❌ <b>فشل الإرسال إلى القناة:</b>\n"
+            f"<code>{html.escape(str(e))}</code>\n\n"
+            f"يرجى التأكد من إضافة البوت كمشرف في القناة <code>{html.escape(ch_id)}</code> ومنحه صلاحية إرسال الرسائل.",
+            parse_mode='HTML'
+        )
+
+
+@router.callback_query(F.data == "adm_backup_view")
+async def handle_admin_backup_view(callback: CallbackQuery):
+    """View database backup settings and trigger manual backup."""
+    await callback.answer()
+    backup_ch_id = await sync_to_async(SystemSettingService.get_setting)('BACKUP_CHANNEL_ID', '')
+    is_auto = await sync_to_async(SystemSettingService.get_bool)('BACKUP_AUTO_ENABLED', True)
+    last_time = await sync_to_async(SystemSettingService.get_setting)('LAST_BACKUP_TIME', 'لم يتم أخذ نسخة بعد')
+    super_admin_id = getattr(settings, 'SUPER_ADMIN_TELEGRAM_ID', 'غير محدد')
+
+    dest_display = backup_ch_id if backup_ch_id else f"حساب المالك الأساسي ({super_admin_id})"
+    auto_status = "🟢 مفعّل" if is_auto else "🔴 معطّل"
+
+    text = (
+        f"📦 <b>إعدادات النسخ الاحتياطي لقاعدة البيانات</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 <b>وجهة استلام النسخة:</b> <code>{html.escape(str(dest_display))}</code>\n"
+        f"⚡ <b>النسخ التلقائي:</b> <b>{auto_status}</b>\n"
+        f"🕒 <b>آخر عملية نسخ:</b> <code>{html.escape(str(last_time))}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"💡 <i>يقوم النظام بضغط كافة جداول قاعدة البيانات والعمليات والمستخدمين والمخزون في ملف مشفر وإرساله مباشرة لتليجرام.</i>\n\n"
+        f"اختر الإجراء المطلوب:"
+    )
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🚀 إنشاء وإرسال نسخة احتياطية الآن", callback_data="adm_run_backup_now"),
+        ],
+        [
+            InlineKeyboardButton(text="🆔 تعديل معرف قناة/شات النسخ", callback_data="adm_edit_backup_id"),
+            InlineKeyboardButton(text=f"🔄 {'تعطيل' if is_auto else 'تفعيل'} النسخ التلقائي", callback_data="adm_toggle_backup_auto"),
+        ],
+        [
+            InlineKeyboardButton(text="⚙️ العودة للإعدادات", callback_data="adm_settings_view"),
+            InlineKeyboardButton(text="🏠 الرئيسية", callback_data="adm_home"),
+        ]
+    ])
+
+    await callback.message.edit_text(text, reply_markup=markup, parse_mode='HTML')
+
+
+@router.callback_query(F.data == "adm_toggle_backup_auto")
+async def handle_toggle_backup_auto(callback: CallbackQuery):
+    """Toggle automated database backup setting."""
+    current = await sync_to_async(SystemSettingService.get_bool)('BACKUP_AUTO_ENABLED', True)
+    new_state = "false" if current else "true"
+    await sync_to_async(SystemSettingService.set_setting)('BACKUP_AUTO_ENABLED', new_state, "تفعيل أو تعطيل النسخ الاحتياطي التلقائي")
+    await callback.answer(f"تم {'تعطيل' if current else 'تفعيل'} النسخ التلقائي بنجاح!", show_alert=True)
+    await handle_admin_backup_view(callback)
+
+
+@router.callback_query(F.data == "adm_edit_backup_id")
+async def handle_prompt_backup_id(callback: CallbackQuery, state: FSMContext):
+    """Prompt admin to enter backup channel or chat ID."""
+    await callback.answer()
+    await state.set_state(AdminSettingsStates.waiting_for_backup_channel_id)
+    await callback.message.answer(
+        "✍️ أرسل <b>معرف قناة النسخ الاحتياطي</b> (مثال: <code>-1001234567890</code> أو <code>@MyBackupChannel</code>)\n"
+        "أو أرسل الآيدي الخاص بك <code>6069495114</code> لاستلامها في محادثتك الخاصة مباشرة:\n\n"
+        "<i>(أرسل 'إلغاء' للإلغاء، أو 'تفريغ' للاعتماد على آيدي المالك الافتراضي)</i>",
+        parse_mode='HTML'
+    )
+
+
+@router.message(AdminSettingsStates.waiting_for_backup_channel_id)
+async def handle_save_backup_id(message: Message, state: FSMContext):
+    """Save backup channel or chat ID."""
+    txt = message.text.strip()
+    if txt.lower() in ("/cancel", "إلغاء", "الغاء"):
+        await state.clear()
+        await message.answer("❌ تم الإلغاء.")
+        return
+
+    await state.clear()
+    new_val = "" if txt in ("تفريغ", "افتراضي", "حذف") else txt
+    await sync_to_async(SystemSettingService.set_setting)(
+        'BACKUP_CHANNEL_ID',
+        new_val,
+        "معرف قناة أو شات النسخ الاحتياطي لقاعدة البيانات"
+    )
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📦 العودة لقسم النسخ الاحتياطي", callback_data="adm_backup_view")],
+        [InlineKeyboardButton(text="⚙️ العودة للإعدادات", callback_data="adm_settings_view")]
+    ])
+    display = new_val if new_val else "حساب المالك الافتراضي"
+    await message.answer(
+        f"✅ تم حفظ وجهة النسخ الاحتياطي: <code>{html.escape(display)}</code>\n"
+        f"تأكد من إضافة بوت الإدارة مشرفاً في القناة إذا كانت قناة خاصة.",
+        reply_markup=markup,
+        parse_mode='HTML'
+    )
+
+
+@router.callback_query(F.data == "adm_run_backup_now")
+async def handle_admin_run_backup_now(callback: CallbackQuery):
+    """Trigger on-demand database backup and send to Telegram."""
+    await callback.answer("⏳ جاري إنشاء النسخة الاحتياطية وإرسالها...", show_alert=True)
+    status_msg = await callback.message.answer("⏳ <i>جاري إنشاء وتجهيز النسخة الاحتياطية لقاعدة البيانات الآن...</i>", parse_mode='HTML')
+
+    success, msg = await DatabaseBackupService.send_backup_to_telegram()
+
+    if success:
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📦 العودة لقسم النسخ الاحتياطي", callback_data="adm_backup_view")],
+            [InlineKeyboardButton(text="🏠 الرئيسية", callback_data="adm_home")]
+        ])
+        await status_msg.edit_text(
+            f"✅ <b>نجحت عملية النسخ الاحتياطي!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"{msg}\n\n"
+            f"تم إرسال الملف المضغوط إلى وجهة النسخ بنجاح.",
+            reply_markup=markup,
+            parse_mode='HTML'
+        )
+    else:
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 محاولة أخرى", callback_data="adm_run_backup_now")],
+            [InlineKeyboardButton(text="📦 العودة للنسخ الاحتياطي", callback_data="adm_backup_view")]
+        ])
+        await status_msg.edit_text(
+            f"❌ <b>فشلت عملية النسخ الاحتياطي:</b>\n"
+            f"<code>{html.escape(msg)}</code>\n\n"
+            f"يرجى التأكد من أن البوت عضو ومشرف في القناة ولديه صلاحية إرسال المستندات.",
+            reply_markup=markup,
+            parse_mode='HTML'
+        )
+
+
+@router.callback_query(F.data == "adm_toggle_referral")
+async def handle_toggle_referral(callback: CallbackQuery):
+    """Toggle referral system on/off."""
+    current = await sync_to_async(SystemSettingService.get_bool)('REFERRAL_ENABLED', True)
+    new_state = "false" if current else "true"
+    await sync_to_async(SystemSettingService.set_setting)('REFERRAL_ENABLED', new_state, "تفعيل أو تعطيل نظام الإحالات")
+    await callback.answer(f"تم {'تعطيل' if current else 'تفعيل'} نظام الإحالات بنجاح!")
+    await handle_admin_settings_view(callback)
 
 
 @router.callback_query(F.data == "adm_edit_rate")
 async def handle_prompt_new_rate(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(AdminExchangeRateStates.waiting_for_rate)
-    await callback.message.answer("✍️ اكتب وأرسل *سعر الصرف الجديد* (مثال: 560):", parse_mode='Markdown')
+    await callback.message.answer("✍️ اكتب وأرسل <b>سعر الصرف الجديد</b> (مثال: 560):", parse_mode='HTML')
 
 
 @router.message(AdminExchangeRateStates.waiting_for_rate)
 async def handle_save_new_rate(message: Message, state: FSMContext):
+    txt = message.text.strip().lower() if message.text else ""
+    if txt in ("/cancel", "إلغاء", "الغاء"):
+        await state.clear()
+        await message.answer("❌ تم الإلغاء.")
+        return
+
     try:
         new_rate = Decimal(message.text.strip().replace(",", ""))
         if new_rate <= 0:
@@ -1543,16 +2462,102 @@ async def handle_save_new_rate(message: Message, state: FSMContext):
     await sync_to_async(update_rate)(new_rate)
 
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💵 أسعار الصرف", callback_data="adm_rate_view")],
+        [InlineKeyboardButton(text="⚙️ العودة للإعدادات", callback_data="adm_settings_view")],
         [InlineKeyboardButton(text="🏠 الرئيسية", callback_data="adm_home")]
     ])
 
     await message.answer(
-        f"✅ *تم تحديث سعر الصرف بنجاح!*\n"
-        f"السعر الجديد: *1 USD = {new_rate:,.2f} YER*",
+        f"✅ <b>تم تحديث سعر الصرف بنجاح!</b>\n"
+        f"السعر الجديد: <b>1 USD = {new_rate:,.2f} YER</b>",
         reply_markup=markup,
-        parse_mode='Markdown'
+        parse_mode='HTML'
     )
+
+
+@router.callback_query(F.data == "adm_edit_store_name")
+async def handle_prompt_new_store_name(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(AdminSettingsStates.waiting_for_store_name)
+    await callback.message.answer("✍️ اكتب وأرسل <b>اسم المتجر الجديد</b> الذي يظهر للعملاء في البوت والرسائل:", parse_mode='HTML')
+
+
+@router.message(AdminSettingsStates.waiting_for_store_name)
+async def handle_save_new_store_name(message: Message, state: FSMContext):
+    txt = message.text.strip()
+    if txt.lower() in ("/cancel", "إلغاء", "الغاء"):
+        await state.clear()
+        await message.answer("❌ تم الإلغاء.")
+        return
+
+    await state.clear()
+    await sync_to_async(SystemSettingService.set_setting)('STORE_NAME', txt, "اسم المتجر العام")
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚙️ العودة للإعدادات", callback_data="adm_settings_view")],
+        [InlineKeyboardButton(text="🏠 الرئيسية", callback_data="adm_home")]
+    ])
+    await message.answer(f"✅ تم تحديث اسم المتجر إلى: <b>{html.escape(txt)}</b>", reply_markup=markup, parse_mode='HTML')
+
+
+@router.callback_query(F.data == "adm_edit_support_user")
+async def handle_prompt_new_support_user(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(AdminSettingsStates.waiting_for_support_user)
+    await callback.message.answer("✍️ اكتب وأرسل <b>يوزر التليجرام الخاص بحساب الدعم</b> (مثال: <code>@MySupportAccount</code> أو أرسل <code>0</code> لإلغاء المعرف والاعتماد على التذاكر فقط):", parse_mode='HTML')
+
+
+@router.message(AdminSettingsStates.waiting_for_support_user)
+async def handle_save_new_support_user(message: Message, state: FSMContext):
+    txt = message.text.strip()
+    if txt.lower() in ("/cancel", "إلغاء", "الغاء"):
+        await state.clear()
+        await message.answer("❌ تم الإلغاء.")
+        return
+
+    await state.clear()
+    val = "" if txt in ("0", "-", "لا يوجد", "none") else txt.lstrip('@')
+    await sync_to_async(SystemSettingService.set_setting)('SUPPORT_USERNAME', val, "يوزر حساب الدعم الفني المباشر")
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚙️ العودة للإعدادات", callback_data="adm_settings_view")],
+        [InlineKeyboardButton(text="🏠 الرئيسية", callback_data="adm_home")]
+    ])
+    display_user = f"@{val}" if val else "بدون معرف (تذاكر داخلية فقط)"
+    await message.answer(f"✅ تم حفظ يوزر الدعم الفني: <b>{html.escape(display_user)}</b>", reply_markup=markup, parse_mode='HTML')
+
+
+@router.callback_query(F.data == "adm_edit_ref_bonus")
+async def handle_prompt_new_ref_bonus(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(AdminSettingsStates.waiting_for_referral_bonus)
+    await callback.message.answer("✍️ اكتب وأرسل <b>مبلغ مكافأة الإحالة بالريال اليمني (YER)</b> التي تضاف للداعي عند انضمام صديق جديد (مثال: <code>50</code>):", parse_mode='HTML')
+
+
+@router.message(AdminSettingsStates.waiting_for_referral_bonus)
+async def handle_save_new_ref_bonus(message: Message, state: FSMContext):
+    txt = message.text.strip().lower()
+    if txt in ("/cancel", "إلغاء", "الغاء"):
+        await state.clear()
+        await message.answer("❌ تم الإلغاء.")
+        return
+
+    try:
+        amount = Decimal(message.text.strip().replace(",", ""))
+        if amount < 0:
+            raise ValueError()
+    except Exception:
+        await message.answer("⚠️ يرجى إدخال مبلغ صحيح (0 أو أكبر):")
+        return
+
+    await state.clear()
+    await sync_to_async(SystemSettingService.set_setting)('REFERRAL_BONUS_YER', str(amount), "مبلغ مكافأة دعوة الأصدقاء بالريال اليمني")
+
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚙️ العودة للإعدادات", callback_data="adm_settings_view")],
+        [InlineKeyboardButton(text="🏠 الرئيسية", callback_data="adm_home")]
+    ])
+    await message.answer(f"✅ تم تحديث مبلغ مكافأة الإحالة إلى: <b>{amount:,.0f} YER</b>", reply_markup=markup, parse_mode='HTML')
+
 
 
 # ==============================================================================
@@ -1569,28 +2574,57 @@ async def handle_channels_list(event: Message | CallbackQuery):
         target = event
 
     channels = await sync_to_async(list)(RequiredChannel.objects.all())
+    mand_sub_enabled = await sync_to_async(SystemSettingService.get_bool)('MANDATORY_SUBSCRIPTION_ENABLED', True)
+    global_status = "🟢 مفعّل (الاشتراك إجباري)" if mand_sub_enabled else "🔴 معطّل (الدخول متاح للجميع)"
 
     buttons = []
-    text_lines = ["📢 *قنوات الاشتراك الإجباري:*\n━━━━━━━━━━━━━━━━━━"]
+    text_lines = [
+        "📢 <b>قنوات الاشتراك الإجباري لبوت المتجر:</b>\n"
+        f"⚡ <b>حالة النظام:</b> <b>{global_status}</b>\n"
+        "━━━━━━━━━━━━━━━━━━"
+    ]
     if not channels:
         text_lines.append("لا توجد قنوات إجبارية مضافة حالياً. (المتجر متاح للجميع بدون قيود)")
     else:
         for ch in channels:
             status = "🟢" if ch.is_active else "🔴"
-            text_lines.append(f"{status} *{ch.channel_title}*\nالمعرف: `{ch.channel_id}`\nالرابط: {ch.invite_link}\n")
+            title_escaped = html.escape(str(ch.channel_title))
+            id_escaped = html.escape(str(ch.channel_id))
+            link_escaped = html.escape(str(ch.invite_link or 'لا يوجد'))
+            text_lines.append(f"{status} <b>{title_escaped}</b>\nالمعرف: <code>{id_escaped}</code>\nالرابط: {link_escaped}\n")
             buttons.append([
                 InlineKeyboardButton(text=f"🗑️ حذف: {ch.channel_title[:20]}", callback_data=f"adm_ch_del:{ch.id}")
             ])
 
     text_lines.append("━━━━━━━━━━━━━━━━━━")
+    buttons.append([
+        InlineKeyboardButton(
+            text=f"🔄 {'تعطيل' if mand_sub_enabled else 'تفعيل'} نظام الاشتراك الإجباري",
+            callback_data="adm_toggle_mand_sub"
+        )
+    ])
     buttons.append([InlineKeyboardButton(text="➕ إضافة قناة إجبارية جديدة", callback_data="adm_ch_add")])
-    buttons.append([InlineKeyboardButton(text="🏠 عودة للرئيسية", callback_data="adm_home")])
+    buttons.append([
+        InlineKeyboardButton(text="⚙️ العودة للإعدادات", callback_data="adm_settings_view"),
+        InlineKeyboardButton(text="🏠 عودة للرئيسية", callback_data="adm_home")
+    ])
 
     markup = InlineKeyboardMarkup(inline_keyboard=buttons)
     if isinstance(event, CallbackQuery):
-        await target.edit_text("\n".join(text_lines), reply_markup=markup, parse_mode='Markdown')
+        await target.edit_text("\n".join(text_lines), reply_markup=markup, parse_mode='HTML')
     else:
-        await target.answer("\n".join(text_lines), reply_markup=markup, parse_mode='Markdown')
+        await target.answer("\n".join(text_lines), reply_markup=markup, parse_mode='HTML')
+
+
+@router.callback_query(F.data == "adm_toggle_mand_sub")
+async def handle_toggle_mandatory_sub(callback: CallbackQuery):
+    """Toggle mandatory channel subscription on/off globally."""
+    current = await sync_to_async(SystemSettingService.get_bool)('MANDATORY_SUBSCRIPTION_ENABLED', True)
+    new_state = "false" if current else "true"
+    await sync_to_async(SystemSettingService.set_setting)('MANDATORY_SUBSCRIPTION_ENABLED', new_state, "تفعيل أو تعطيل نظام الاشتراك الإجباري")
+    ChannelSubscriptionService.clear_cache()
+    await callback.answer(f"تم {'تعطيل' if current else 'تفعيل'} نظام الاشتراك الإجباري بنجاح!", show_alert=True)
+    await handle_channels_list(callback)
 
 
 @router.callback_query(F.data.startswith("adm_ch_del:"))
@@ -1630,7 +2664,7 @@ async def handle_channel_title_entered(message: Message, state: FSMContext):
     await state.update_data(ch_title=title)
     await state.set_state(AdminAddChannelStates.waiting_for_channel_id)
     await message.answer(
-        "🆔 *الخطوة 2/3:* اكتب *معرف القناة أو يوزرها* (مثال: `@duudsuccess` أو `-10012345678`):\n"
+        "🆔 *الخطوة 2/3:* اكتب *معرف القناة أو يوزرها* (مثال: `@your_channel` أو `-10012345678`):\n"
         "⚠️ ملاحظة: تأكد من إضافة بوت المتجر كمشرف في القناة!",
         parse_mode='Markdown'
     )
@@ -1641,7 +2675,7 @@ async def handle_channel_id_entered(message: Message, state: FSMContext):
     ch_id = message.text.strip()
     await state.update_data(ch_id=ch_id)
     await state.set_state(AdminAddChannelStates.waiting_for_invite_link)
-    await message.answer("🔗 *الخطوة 3/3:* أرسل *رابط الدعوة للقناة* (مثال: `https://t.me/duudsuccess`):", parse_mode='Markdown')
+    await message.answer("🔗 *الخطوة 3/3:* أرسل *رابط الدعوة للقناة* (مثال: `https://t.me/your_channel`):", parse_mode='Markdown')
 
 
 @router.message(AdminAddChannelStates.waiting_for_invite_link)
@@ -1778,3 +2812,258 @@ async def handle_admin_back_home(callback: CallbackQuery, state: FSMContext):
             await callback.message.edit_text(text, reply_markup=get_admin_dashboard_markup(), parse_mode='Markdown')
         except Exception:
             await callback.message.answer(text, reply_markup=get_admin_dashboard_markup(), parse_mode='Markdown')
+
+
+# ==============================================================================
+# 13. إدارة الخدمات الرقمية (Digital Services Management)
+# ==============================================================================
+
+@router.callback_query(F.data == "adm_services_list")
+@router.message(F.text == "🛠 إدارة الخدمات الرقمية")
+async def handle_admin_services_list(event: Message | CallbackQuery, state: FSMContext = None):
+    """View and manage digital services."""
+    if state:
+        await state.clear()
+        
+    user_id = event.from_user.id
+    is_admin = await sync_to_async(AdminAuthService.is_admin)(user_id)
+    if not is_admin:
+        return
+
+    if isinstance(event, CallbackQuery):
+        await event.answer()
+        target = event.message
+    else:
+        target = event
+
+    services = await sync_to_async(list)(DigitalService.objects.all().order_by('-created_at'))
+    pending_quotes = await sync_to_async(ServiceRequest.objects.filter(status='PENDING_QUOTE').count)()
+
+    buttons = []
+    text_lines = ["🛠 <b>إدارة الخدمات الرقمية المخصصة:</b>\n━━━━━━━━━━━━━━━━━━"]
+
+    if not services:
+        text_lines.append("لا توجد خدمات رقمية مضافة حالياً.")
+    else:
+        for srv in services:
+            status = "🟢" if srv.is_active else "🔴"
+            type_label = "سعر ثابت" if srv.service_type == 'FIXED' else "تسعير مخصص"
+            price_text = f"{srv.price_yer:,.0f} YER" if srv.service_type == 'FIXED' else "حسب العرض"
+            text_lines.append(f"{status} <b>{html.escape(srv.name)}</b> ({type_label} - {price_text})")
+            
+            toggle_action = "تعطيل" if srv.is_active else "تفعيل"
+            buttons.append([
+                InlineKeyboardButton(text=f"🔄 {toggle_action}: {srv.name[:15]}", callback_data=f"adm_srv_tog:{srv.id}"),
+                InlineKeyboardButton(text="🗑️ حذف", callback_data=f"adm_srv_del:{srv.id}")
+            ])
+
+    text_lines.append("━━━━━━━━━━━━━━━━━━")
+    if pending_quotes > 0:
+        text_lines.append(f"⚠️ يوجد <b>{pending_quotes}</b> طلبات خدمات جديدة بانتظار تقديم عرض السعر!")
+        buttons.append([InlineKeyboardButton(text=f"💼 طلبات بانتظار التسعير ({pending_quotes})", callback_data="adm_srv_reqs")])
+
+    buttons.append([InlineKeyboardButton(text="➕ إضافة خدمة رقمية جديدة", callback_data="adm_srv_add")])
+    buttons.append([InlineKeyboardButton(text="🏠 عودة للرئيسية", callback_data="adm_home")])
+
+    markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+    if isinstance(event, CallbackQuery):
+        try:
+            await target.edit_text("\n".join(text_lines), reply_markup=markup, parse_mode='HTML')
+        except Exception:
+            await target.answer("\n".join(text_lines), reply_markup=markup, parse_mode='HTML')
+    else:
+        await target.answer("\n".join(text_lines), reply_markup=markup, parse_mode='HTML')
+
+
+@router.callback_query(F.data.startswith("adm_srv_tog:"))
+async def handle_service_toggle(callback: CallbackQuery):
+    """Toggle digital service active status."""
+    await callback.answer()
+    srv_id = callback.data.split(":")[1]
+
+    def _toggle():
+        srv = DigitalService.objects.filter(id=srv_id).first()
+        if srv:
+            srv.is_active = not srv.is_active
+            srv.save(update_fields=['is_active'])
+            return srv.is_active
+        return None
+
+    await sync_to_async(_toggle)()
+    await handle_admin_services_list(callback)
+
+
+@router.callback_query(F.data.startswith("adm_srv_del:"))
+async def handle_service_del(callback: CallbackQuery):
+    """Delete a digital service."""
+    await callback.answer()
+    srv_id = callback.data.split(":")[1]
+
+    def _del():
+        srv = DigitalService.objects.filter(id=srv_id).first()
+        if srv:
+            srv.delete()
+            return True
+        return False
+
+    await sync_to_async(_del)()
+    try:
+        await callback.answer("تم حذف الخدمة بنجاح!", show_alert=True)
+    except Exception:
+        pass
+    await handle_admin_services_list(callback)
+
+
+@router.callback_query(F.data == "adm_srv_add")
+async def handle_service_add_start(callback: CallbackQuery, state: FSMContext):
+    """Start FSM wizard to add a new digital service."""
+    await callback.answer()
+    await state.set_state(AdminAddDigitalServiceStates.waiting_for_name)
+    cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ إلغاء", callback_data="adm_services_list")]
+    ])
+    await callback.message.answer(
+        "🛠 <b>إضافة خدمة رقمية جديدة</b>\n\nأرسل <b>اسم الخدمة</b> (مثال: شحن تيك توك عملات، ترقية حساب، تصميم متجر):",
+        reply_markup=cancel_kb,
+        parse_mode='HTML'
+    )
+
+
+@router.message(AdminAddDigitalServiceStates.waiting_for_name)
+async def handle_service_add_name(message: Message, state: FSMContext):
+    name = message.text.strip()
+    if len(name) < 2:
+        await message.answer("⚠️ الاسم قصير جداً، يرجى كتابة اسم مناسب للخدمة:")
+        return
+    await state.update_data(srv_name=name)
+    await state.set_state(AdminAddDigitalServiceStates.waiting_for_desc)
+    await message.answer(
+        f"📝 تم حفظ الاسم: <b>{html.escape(name)}</b>\n\nالآن أرسل <b>وصف الخدمة</b> والشروط والتفاصيل للعميل:",
+        parse_mode='HTML'
+    )
+
+
+@router.message(AdminAddDigitalServiceStates.waiting_for_desc)
+async def handle_service_add_desc(message: Message, state: FSMContext):
+    desc = message.text.strip()
+    await state.update_data(srv_desc=desc)
+    await state.set_state(AdminAddDigitalServiceStates.waiting_for_type)
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏷️ خدمة بسعر ثابت (شراء مباشر)", callback_data="adm_srv_settype:FIXED")],
+        [InlineKeyboardButton(text="💼 خدمة مخصصة (تسعير وعرض سعر)", callback_data="adm_srv_settype:CUSTOM")],
+        [InlineKeyboardButton(text="❌ إلغاء", callback_data="adm_services_list")]
+    ])
+    await message.answer(
+        "⚙️ اختر <b>نوع تسعير الخدمة</b>:",
+        reply_markup=markup,
+        parse_mode='HTML'
+    )
+
+
+@router.callback_query(F.data.startswith("adm_srv_settype:"))
+async def handle_service_add_type(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    stype = callback.data.split(":")[1]
+    await state.update_data(srv_type=stype)
+    
+    if stype == 'FIXED':
+        await state.set_state(AdminAddDigitalServiceStates.waiting_for_price)
+        await callback.message.answer(
+            "💰 أدخل <b>سعر الخدمة الثابت بالريال اليمني (YER)</b> (مثال: 5000):",
+            parse_mode='HTML'
+        )
+    else:
+        await state.update_data(srv_price=Decimal('0.00'))
+        await state.set_state(AdminAddDigitalServiceStates.waiting_for_instructions)
+        await callback.message.answer(
+            "📋 أرسل <b>البيانات أو الحقول المطلوبة من العميل</b> عند طلب الخدمة (مثال: 'أرسل رابط الحساب والبريد الإلكتروني'):",
+            parse_mode='HTML'
+        )
+
+
+@router.message(AdminAddDigitalServiceStates.waiting_for_price)
+async def handle_service_add_price(message: Message, state: FSMContext):
+    txt = message.text.strip().replace(',', '')
+    try:
+        val = Decimal(txt)
+        if val < 0:
+            raise ValueError()
+    except Exception:
+        await message.answer("⚠️ يرجى إدخال رقم صحيح وموجب للسعر (مثال: 5000):")
+        return
+    await state.update_data(srv_price=val)
+    await state.set_state(AdminAddDigitalServiceStates.waiting_for_instructions)
+    await message.answer(
+        "📋 أرسل الآن <b>البيانات أو التعليمات المطلوبة من العميل</b> عند الشراء (مثال: 'أدخل رقم الهوية أو الـ ID الخاص بحسابك'):",
+        parse_mode='HTML'
+    )
+
+
+@router.message(AdminAddDigitalServiceStates.waiting_for_instructions)
+async def handle_service_add_finish(message: Message, state: FSMContext):
+    instructions = message.text.strip()
+    data = await state.get_data()
+    await state.clear()
+
+    name = data.get('srv_name')
+    desc = data.get('srv_desc')
+    stype = data.get('srv_type', 'FIXED')
+    price = data.get('srv_price', Decimal('0.00'))
+
+    def _create():
+        return DigitalService.objects.create(
+            name=name,
+            description=desc,
+            service_type=stype,
+            price_yer=price,
+            instructions=instructions,
+            is_active=True
+        )
+
+    srv = await sync_to_async(_create)()
+
+    await message.answer(
+        f"✅ <b>تمت إضافة الخدمة الرقمية بنجاح!</b>\n\n"
+        f"🛠 الاسم: <b>{html.escape(srv.name)}</b>\n"
+        f"🏷 النوع: <b>{'سعر ثابت' if srv.service_type == 'FIXED' else 'تسعير مخصص'}</b>\n"
+        f"💰 السعر: <b>{srv.price_yer:,.0f} YER</b>\n\n"
+        f"الخدمة الآن متاحة للعملاء في بوت العميل تحت قسم <b>🛎 الخدمات</b>.",
+        parse_mode='HTML'
+    )
+    await handle_admin_services_list(message)
+
+
+@router.callback_query(F.data == "adm_srv_reqs")
+async def handle_service_requests_list(callback: CallbackQuery):
+    """View pending service quotation requests from customers."""
+    await callback.answer()
+    
+    def _fetch_pending():
+        return list(ServiceRequest.objects.filter(status='PENDING_QUOTE').select_related('service', 'user')[:10])
+
+    reqs = await sync_to_async(_fetch_pending)()
+    buttons = []
+    text_lines = ["📋 <b>طلبات الخدمات المخصصة بانتظار التسعير:</b>\n━━━━━━━━━━━━━━━━━━"]
+
+    if not reqs:
+        text_lines.append("لا توجد طلبات معلقة بانتظار التسعير حالياً.")
+    else:
+        for r in reqs:
+            user_label = r.user.first_name or r.user.username or str(r.user.telegram_id)
+            text_lines.append(
+                f"🔹 <b>طلب #{str(r.id)[:6]}</b>\n"
+                f"الخدمة: <b>{html.escape(r.service.name)}</b>\n"
+                f"العميل: {html.escape(user_label)}\n"
+                f"ملاحظات العميل: <i>{html.escape(r.customer_notes[:100])}</i>\n"
+            )
+
+    text_lines.append("━━━━━━━━━━━━━━━━━━")
+    buttons.append([InlineKeyboardButton(text="🔙 عودة لقائمة الخدمات", callback_data="adm_services_list")])
+    buttons.append([InlineKeyboardButton(text="🏠 الرئيسية", callback_data="adm_home")])
+
+    markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+    try:
+        await callback.message.edit_text("\n".join(text_lines), reply_markup=markup, parse_mode='HTML')
+    except Exception:
+        await callback.message.answer("\n".join(text_lines), reply_markup=markup, parse_mode='HTML')

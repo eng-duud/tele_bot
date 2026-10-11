@@ -10,8 +10,9 @@ from apps.telegram_bot.common.states import ServiceOrderStates
 router = Router()
 
 @router.message(F.text == "🛎 الخدمات")
-async def handle_services_menu(message: Message):
+async def handle_services_menu(message: Message, user_profile: TelegramProfile):
     """View digital services menu."""
+    from apps.core.services import CurrencyService
     services = await sync_to_async(list)(DigitalService.objects.filter(is_active=True))
     if not services:
         await message.answer("عذراً، لا توجد خدمات رقمية متاحة حالياً.")
@@ -19,7 +20,11 @@ async def handle_services_menu(message: Message):
 
     buttons = []
     for s in services:
-        badge = f"({s.price_yer:,.0f} YER)" if s.service_type == 'FIXED' else "(تسعير مخصص)"
+        if s.service_type == 'FIXED':
+            p_badge = CurrencyService.format_button_price(s.price_yer, user_profile.preferred_currency)
+            badge = f"({p_badge})"
+        else:
+            badge = "(تسعير مخصص)"
         buttons.append([InlineKeyboardButton(text=f"🛎 {s.name} {badge}", callback_data=f"srv:{s.id}")])
     buttons.append([InlineKeyboardButton(text="🏠 الرئيسية", callback_data="menu_home")])
 

@@ -1,6 +1,8 @@
 from apps.catalog.models import Product
 from apps.providers.base import BaseFulfillmentProvider, ProviderOrderResult
 from apps.providers.mock_provider import MockFulfillmentProvider
+from apps.providers.http_provider import HttpFulfillmentProvider
+from apps.providers.vente_provider import VenteBotProvider
 from apps.providers.models import ApiProvider, ProviderProductMapping
 
 class ProviderDispatcherService:
@@ -12,11 +14,14 @@ class ProviderDispatcherService:
         api_key = provider.get_api_key()
         api_secret = provider.get_api_secret()
 
+        if provider.provider_type == 'VENTE_BOT' or 'ventetelegrambotrailway' in (provider.base_url or '').lower():
+            return VenteBotProvider(api_key=api_key, api_secret=api_secret, base_url=provider.base_url)
+
         if provider.provider_type == 'MOCK':
             return MockFulfillmentProvider(api_key=api_key, api_secret=api_secret, base_url=provider.base_url)
         
-        # Extensible for future real integrations
-        return MockFulfillmentProvider(api_key=api_key, api_secret=api_secret, base_url=provider.base_url)
+        # Real HTTP / REST / SMM integrations
+        return HttpFulfillmentProvider(api_key=api_key, api_secret=api_secret, base_url=provider.base_url)
 
     @classmethod
     def execute_provider_order(cls, product: Product, quantity: int = 1, customer_input: str = "") -> ProviderOrderResult:

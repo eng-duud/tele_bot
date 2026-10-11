@@ -3,9 +3,11 @@ from apps.users.models import TelegramProfile, AdminPermission, AdminRole, Admin
 
 @admin.register(TelegramProfile)
 class TelegramProfileAdmin(admin.ModelAdmin):
-    list_display = ('telegram_id', 'username', 'first_name', 'preferred_currency', 'is_admin', 'is_banned', 'created_at')
+    list_display = ('telegram_id', 'username', 'first_name', 'preferred_currency', 'referred_by', 'referral_bonus_paid', 'is_admin', 'is_banned', 'created_at')
     search_fields = ('telegram_id', 'username', 'first_name')
-    list_filter = ('is_admin', 'is_banned', 'preferred_currency')
+    list_filter = ('is_admin', 'is_banned', 'referral_bonus_paid', 'preferred_currency')
+    raw_id_fields = ('referred_by',)
+
 
 @admin.register(AdminPermission)
 class AdminPermissionAdmin(admin.ModelAdmin):

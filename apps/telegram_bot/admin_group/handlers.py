@@ -1,6 +1,8 @@
+import html
 import logging
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
 from asgiref.sync import sync_to_async
 from django.utils import timezone
 from apps.users.models import TelegramProfile
@@ -263,4 +265,134 @@ async def handle_admin_contact_user(callback: CallbackQuery):
         f"معرف العميل الرقمي: {user_id}\nيمكنك فتح محادثته بالضغط المباشر على اسمه في نص الإشعار أعلاه.",
         show_alert=True
     )
+
+
+# ==============================================================================
+# Support Tickets Admin Group Handlers
+# ==============================================================================
+
+@router.callback_query(F.data.startswith("adm_ticket_reply:"))
+async def handle_admin_click_reply_ticket(callback: CallbackQuery, state: FSMContext):
+    """Admin clicks [✍️ الرد على العميل] in Admin Group."""
+    ticket_id = callback.data.split(":")[1]
+    from apps.support.models import SupportTicket
+    ticket = await sync_to_async(SupportTicket.objects.filter(id=ticket_id).select_related('user').first)()
+    if not ticket:
+        await callback.answer("⚠️ التذكرة غير موجودة.", show_alert=True)
+        return
+
+    if ticket.status == 'CLOSED':
+        await callback.answer("⚠️ هذه التذكرة مغلقة بالفعل.", show_alert=True)
+        return
+
+    await state.update_data(reply_ticket_id=ticket_id, card_message_id=callback.message.message_id)
+    from apps.telegram_bot.common.states import AdminReplyTicketStates
+    await state.set_state(AdminReplyTicketStates.waiting_for_reply_text)
+
+    await callback.answer()
+    import html
+    u_name = html.escape(ticket.user.full_name or "العميل")
+    prompt_text = (
+        f"✍️ <b>كتابة الرد على التذكرة {ticket.ticket_number}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>العميل:</b> {u_name}\n\n"
+        f"يرجى إرسال <b>نص الرد</b> الآن هنا، وسيتم توجيهه مباشرة للعميل في محادثته الخاصة.\n"
+        f"<i>(للإلغاء أرسل: إلغاء)</i>"
+    )
+    await callback.message.reply(prompt_text, parse_mode='HTML')
+
+
+@router.message(F.text, F.reply_to_message)
+async def handle_admin_direct_reply_by_telegram(message, user_profile: TelegramProfile):
+    """Allow admins to reply directly to customer by using Telegram's native 'Reply' to the ticket card."""
+    from apps.support.models import SupportTicket
+    from apps.support.services import SupportService
+    
+    # Check if the replied-to message is an admin ticket card
+    replied_msg_id = message.reply_to_message.message_id
+    ticket = await sync_to_async(SupportTicket.objects.filter(admin_message_id=replied_msg_id).first)()
+    if not ticket:
+        return  # Not replying to a ticket card
+
+    reply_text = message.text.strip()
+    if reply_text.lower() in ("إلغاء", "الغاء", "/cancel"):
+        await message.reply("تم الإلغاء.")
+        return
+
+    success, msg, updated_ticket = await sync_to_async(SupportService.reply_to_ticket)(
+        ticket_id=str(ticket.id),
+        admin_profile=user_profile,
+        reply_text=reply_text
+    )
+
+    if success:
+        admin_name = message.from_user.full_name or "المشرف"
+        await message.reply(f"✅ تم إرسال الرد للعميل بنجاح بخصوص التذكرة {ticket.ticket_number} بواسطة {admin_name}.")
+    else:
+        await message.reply(f"⚠️ تعذر إرسال الرد: {msg}")
+
+
+from apps.telegram_bot.common.states import AdminReplyTicketStates
+@router.message(AdminReplyTicketStates.waiting_for_reply_text)
+async def handle_admin_reply_text_received(message, user_profile: TelegramProfile, state: FSMContext):
+    """Receive reply text from admin state and send to customer."""
+    data = await state.get_data()
+    ticket_id = data.get("reply_ticket_id")
+    await state.clear()
+
+    if not ticket_id:
+        return
+
+    reply_text = message.text.strip()
+    if reply_text.lower() in ("إلغاء", "الغاء", "/cancel"):
+        await message.reply("❌ تم إلغاء كتابة الرد.")
+        return
+
+    from apps.support.services import SupportService
+    success, msg, updated_ticket = await sync_to_async(SupportService.reply_to_ticket)(
+        ticket_id=ticket_id,
+        admin_profile=user_profile,
+        reply_text=reply_text
+    )
+
+    if success and updated_ticket:
+        admin_name = message.from_user.full_name or "المشرف"
+        await message.reply(f"✅ <b>تم إرسال الرد للعميل بنجاح</b> بخصوص التذكرة <code>{updated_ticket.ticket_number}</code> بواسطة {admin_name}.", parse_mode='HTML')
+    else:
+        await message.reply(f"⚠️ {msg}")
+
+
+@router.callback_query(F.data.startswith("adm_ticket_close:"))
+async def handle_admin_close_ticket(callback: CallbackQuery, user_profile: TelegramProfile):
+    """Admin closes support ticket."""
+    ticket_id = callback.data.split(":")[1]
+    from apps.support.services import SupportService
+    success, msg, ticket = await sync_to_async(SupportService.close_ticket)(
+        ticket_id=ticket_id,
+        admin_profile=user_profile
+    )
+
+    if not success or not ticket:
+        await callback.answer(f"⚠️ {msg}", show_alert=True)
+        return
+
+    await callback.answer("🔒 تم إغلاق التذكرة بنجاح.", show_alert=False)
+    admin_name = html.escape(callback.from_user.full_name or "المشرف")
+    new_caption = (
+        f"🔒 <b>تم إغلاق تذكرة الدعم الفني</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🔖 <b>رقم التذكرة:</b> <code>{ticket.ticket_number}</code>\n"
+        f"👤 <b>العميل:</b> {html.escape(ticket.user.full_name)}\n"
+        f"👮‍♂️ <b>أغلقت بواسطة:</b> {admin_name}\n"
+        f"📅 <b>تاريخ الإغلاق:</b> <code>{timezone.now().strftime('%Y-%m-%d %I:%M %p')}</code>"
+    )
+
+    try:
+        if callback.message.photo:
+            await callback.message.edit_caption(caption=new_caption, reply_markup=None, parse_mode='HTML')
+        else:
+            await callback.message.edit_text(text=new_caption, reply_markup=None, parse_mode='HTML')
+    except Exception:
+        pass
+
 

@@ -1,6 +1,7 @@
 import logging
 from typing import Callable, Dict, Any, Awaitable, Tuple
 from django.conf import settings
+from django.db import connections, close_old_connections, InterfaceError, OperationalError
 from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject, Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from asgiref.sync import sync_to_async
@@ -13,6 +14,58 @@ from apps.notifications.services import ChannelSubscriptionService
 import time
 
 logger = logging.getLogger(__name__)
+
+def reset_db_connections():
+    """Ensure database connections are alive; cleanly close stale or dead sockets."""
+    for conn in connections.all(initialized_only=True):
+        try:
+            if not conn.is_usable():
+                conn.close()
+            else:
+                conn.close_if_unusable_or_obsolete()
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+def force_close_db_connections():
+    """Force-close all database connections so subsequent queries re-establish a fresh socket."""
+    for conn in connections.all(initialized_only=True):
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+class DatabaseConnectionMiddleware(BaseMiddleware):
+    """
+    Guarantees database connection health for long-running asyncio bot processes.
+    Automatically refreshes idle/dropped SSL connections (e.g. Neon PostgreSQL serverless)
+    and prevents 'SSL connection has been closed unexpectedly' or 'connection already closed' errors.
+    """
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        await sync_to_async(reset_db_connections)()
+        try:
+            return await handler(event, data)
+        except (OperationalError, InterfaceError) as db_err:
+            logger.warning(f"Database connection error caught in middleware ({db_err}). Force-resetting and retrying...")
+            await sync_to_async(force_close_db_connections)()
+            try:
+                return await handler(event, data)
+            except Exception:
+                await sync_to_async(force_close_db_connections)()
+                raise
+        except Exception:
+            await sync_to_async(reset_db_connections)()
+            raise
+        finally:
+            await sync_to_async(reset_db_connections)()
 
 # Fast in-memory user cache: telegram_id -> (profile, timestamp)
 _USER_CACHE: Dict[int, Tuple[TelegramProfile, float]] = {}
@@ -36,20 +89,50 @@ class UserAutoRegisterMiddleware(BaseMiddleware):
             if len(_USER_CACHE) > 5000:
                 _USER_CACHE.clear()
 
+            # Extract potential referrer from /start ref_12345
+            referrer_id = None
+            is_start_ref = False
+            if isinstance(event, Message) and event.text and event.text.startswith("/start"):
+                parts = event.text.split()
+                if len(parts) > 1 and parts[1].startswith("ref_"):
+                    ref_str = parts[1].replace("ref_", "").strip()
+                    if ref_str.isdigit():
+                        referrer_id = int(ref_str)
+                        is_start_ref = True
+
             cached = _USER_CACHE.get(user.id)
-            if cached and (now - cached[1] < CACHE_TTL):
+            if cached and (now - cached[1] < CACHE_TTL) and not is_start_ref:
                 profile = cached[0]
+                referral_info = {'status': None, 'message': ''}
             else:
-                profile, _ = await sync_to_async(UserService.get_or_create_user)(
-                    telegram_id=user.id,
-                    username=user.username or "",
-                    first_name=user.first_name or "",
-                    last_name=user.last_name or ""
-                )
+                try:
+                    profile, created, referral_info = await sync_to_async(UserService.get_or_create_user)(
+                        telegram_id=user.id,
+                        username=user.username or "",
+                        first_name=user.first_name or "",
+                        last_name=user.last_name or "",
+                        referrer_id=referrer_id
+                    )
+                except (OperationalError, InterfaceError):
+                    await sync_to_async(force_close_db_connections)()
+                    profile, created, referral_info = await sync_to_async(UserService.get_or_create_user)(
+                        telegram_id=user.id,
+                        username=user.username or "",
+                        first_name=user.first_name or "",
+                        last_name=user.last_name or "",
+                        referrer_id=referrer_id
+                    )
                 _USER_CACHE[user.id] = (profile, now)
 
+            data["referral_info"] = referral_info
+
+
             # Always retrieve fresh wallet so balance updates are instantaneous
-            wallet = await sync_to_async(WalletService.get_or_create_wallet)(profile)
+            try:
+                wallet = await sync_to_async(WalletService.get_or_create_wallet)(profile)
+            except (OperationalError, InterfaceError):
+                await sync_to_async(force_close_db_connections)()
+                wallet = await sync_to_async(WalletService.get_or_create_wallet)(profile)
 
             data["user_profile"] = profile
             data["user_wallet"] = wallet

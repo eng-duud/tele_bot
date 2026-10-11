@@ -27,11 +27,21 @@ async def handle_wallet_menu(event: Message | CallbackQuery, user_profile: Teleg
     yer_bal = user_wallet.balance_yer
     usd_bal = await sync_to_async(CurrencyService.convert)(yer_bal, from_curr='YER', to_curr='USD')
 
+    if user_profile.preferred_currency == 'USD':
+        bal_lines = (
+            f"🇺🇸 الرصيد الأساسي: *${usd_bal:,.2f} USD*\n"
+            f"🇾🇪 ما يعادله بالريال: *{yer_bal:,.0f} YER*\n"
+        )
+    else:
+        bal_lines = (
+            f"🇾🇪 الرصيد الأساسي: *{yer_bal:,.0f} YER*\n"
+            f"🇺🇸 ما يعادله بالدولار: *${usd_bal:,.2f} USD*\n"
+        )
+
     text = (
         f"💰 *محفظتك الإلكترونية*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"🇾🇪 الرصيد بالريال: *{yer_bal:,.0f} YER*\n"
-        f"🇺🇸 الرصيد بالدولار: *${usd_bal:,.2f} USD*\n"
+        f"{bal_lines}"
         f"━━━━━━━━━━━━━━━━━━\n"
         "يمكنك استخدام رصيد محفظتك لشراء أي منتج أو خدمة رقمية في المتجر فورياً وبدون انتظار موافقات."
     )

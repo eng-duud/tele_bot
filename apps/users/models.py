@@ -17,6 +17,18 @@ class TelegramProfile(TimeStampedModel):
     is_banned = models.BooleanField(_('محظور'), default=False)
     is_admin = models.BooleanField(_('مشرف'), default=False)
 
+    # Referral & Affiliate System
+    referred_by = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='referrals',
+        verbose_name=_('تمت دعوته بواسطة')
+    )
+    referral_bonus_paid = models.BooleanField(_('تم صرف مكافأة الإحالة'), default=False)
+
+
     class Meta:
         verbose_name = _('مستخدم تليجرام')
         verbose_name_plural = _('مستخدمو تليجرام')

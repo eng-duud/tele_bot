@@ -78,12 +78,15 @@ async def handle_order_view(callback: CallbackQuery, user_profile: TelegramProfi
     status_disp = html.escape(details['status_display'])
     date_str = html.escape(details['date_str'])
 
+    from apps.core.services import CurrencyService
+    price_disp = CurrencyService.format_dual_price(details['total_amount'], user_profile.preferred_currency)
+
     text_lines = [
         f"🔖 <b>تفاصيل الطلب: {details['order_number']}</b>",
         f"━━━━━━━━━━━━━━━━━━",
         f"🛍 المنتج: <b>{prod_title}</b>",
         f"🔢 الكمية: {details['quantity']}",
-        f"💰 الإجمالي: <b>{details['total_amount']:,.0f} YER</b>",
+        f"💰 الإجمالي: <b>{price_disp}</b>",
         f"📅 التاريخ: <code>{date_str}</code>",
         f"⚡ الحالة: <b>{status_disp}</b>",
         f"━━━━━━━━━━━━━━━━━━"
@@ -112,7 +115,7 @@ async def handle_order_view(callback: CallbackQuery, user_profile: TelegramProfi
             f"━━━━━━━━━━━━━━━━━━",
             f"🛍 المنتج: {details['title']}",
             f"🔢 الكمية: {details['quantity']}",
-            f"💰 الإجمالي: {details['total_amount']:,.0f} YER",
+            f"💰 الإجمالي: {price_disp}",
             f"📅 التاريخ: {details['date_str']}",
             f"⚡ الحالة: {details['status_display']}",
             f"━━━━━━━━━━━━━━━━━━"

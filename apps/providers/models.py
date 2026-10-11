@@ -9,6 +9,7 @@ class ApiProvider(TimeStampedModel):
     PROVIDER_TYPE_CHOICES = (
         ('MOCK', 'مزود تجريبي ومحاكي (Mock / Simulator)'),
         ('CUSTOM_HTTP', 'مزود API خارجي حقيقي'),
+        ('VENTE_BOT', 'مزود Vente Telegram Bot API'),
     )
 
     name = models.CharField(_('اسم المزود'), max_length=150)
@@ -26,17 +27,41 @@ class ApiProvider(TimeStampedModel):
     def __str__(self):
         return f"{self.name} [{self.provider_code}]"
 
+    def save(self, *args, **kwargs):
+        # Auto-encrypt if user entered raw plaintext in Django Admin
+        if self.api_key_encrypted and not self.api_key_encrypted.startswith('gAAAAA'):
+            try:
+                self.api_key_encrypted = encrypt_data(self.api_key_encrypted)
+            except Exception:
+                pass
+        if self.api_secret_encrypted and not self.api_secret_encrypted.startswith('gAAAAA'):
+            try:
+                self.api_secret_encrypted = encrypt_data(self.api_secret_encrypted)
+            except Exception:
+                pass
+        super().save(*args, **kwargs)
+
     def set_api_key(self, raw_key: str):
         self.api_key_encrypted = encrypt_data(raw_key)
 
     def get_api_key(self) -> str:
-        return decrypt_data(self.api_key_encrypted)
+        if not self.api_key_encrypted:
+            return ""
+        try:
+            return decrypt_data(self.api_key_encrypted)
+        except Exception:
+            return self.api_key_encrypted
 
     def set_api_secret(self, raw_secret: str):
         self.api_secret_encrypted = encrypt_data(raw_secret)
 
     def get_api_secret(self) -> str:
-        return decrypt_data(self.api_secret_encrypted)
+        if not self.api_secret_encrypted:
+            return ""
+        try:
+            return decrypt_data(self.api_secret_encrypted)
+        except Exception:
+            return self.api_secret_encrypted
 
 
 class ProviderProductMapping(TimeStampedModel):

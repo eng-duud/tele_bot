@@ -46,8 +46,10 @@ INSTALLED_APPS = [
     'apps.services_app.apps.ServicesAppConfig',
     'apps.notifications.apps.NotificationsConfig',
     'apps.audit.apps.AuditConfig',
+    'apps.support.apps.SupportConfig',
     'apps.telegram_bot.apps.TelegramBotConfig',
 ]
+
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
@@ -87,17 +89,31 @@ USE_POSTGRES = os.getenv('USE_POSTGRES', 'False').lower() in ('true', '1', 't') 
 if DATABASE_URL:
     import urllib.parse
     parsed_url = urllib.parse.urlparse(DATABASE_URL)
+    hostname = parsed_url.hostname or ''
     query_params = urllib.parse.parse_qs(parsed_url.query)
-    ssl_mode = query_params.get('sslmode', ['require'])[0]
+
+    # Determine default sslmode: 'require' for remote cloud (Neon), 'disable' for local VPS
+    is_local_host = hostname in ('localhost', '127.0.0.1', '')
+    default_ssl = 'disable' if is_local_host else ('require' if 'neon.tech' in hostname else 'prefer')
+    ssl_mode = query_params.get('sslmode', [default_ssl])[0]
 
     raw_user = urllib.parse.unquote(parsed_url.username or '')
-    hostname = parsed_url.hostname or ''
-    db_options = {'sslmode': ssl_mode}
+    db_options = {}
+    if ssl_mode and ssl_mode != 'disable':
+        db_options['sslmode'] = ssl_mode
 
     # Neon Cloud options
     if 'neon.tech' in hostname:
         endpoint_id = hostname.split('.')[0].replace('-pooler', '')
         db_options['options'] = f'endpoint={endpoint_id}'
+
+    # TCP Keepalive options to prevent intermediate proxies/firewalls from silently terminating idle connections
+    db_options.update({
+        'keepalives': 1,
+        'keepalives_idle': 30,
+        'keepalives_interval': 10,
+        'keepalives_count': 5,
+    })
 
     DATABASES = {
         'default': {
@@ -108,7 +124,7 @@ if DATABASE_URL:
             'HOST': hostname,
             'PORT': parsed_url.port or 5432,
             'OPTIONS': db_options,
-            'CONN_MAX_AGE': 600,
+            'CONN_MAX_AGE': int(os.getenv('DB_CONN_MAX_AGE', '60')),
             'CONN_HEALTH_CHECKS': True,
         }
     }
@@ -121,6 +137,8 @@ elif USE_POSTGRES:
             'PASSWORD': os.getenv('DB_PASSWORD', 'postgres'),
             'HOST': os.getenv('DB_HOST', 'localhost'),
             'PORT': os.getenv('DB_PORT', '5432'),
+            'CONN_MAX_AGE': int(os.getenv('DB_CONN_MAX_AGE', '60')),
+            'CONN_HEALTH_CHECKS': True,
         }
     }
 else:

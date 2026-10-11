@@ -16,6 +16,9 @@ aiogram
 # Security & Encryption
 cryptography
 
+# Cloud Storage
+cloudinary
+
 # Utilities & Config
 python-dotenv
 pydantic

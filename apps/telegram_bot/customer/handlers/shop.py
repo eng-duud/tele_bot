@@ -44,7 +44,7 @@ async def handle_cat_root(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("cat:"))
-async def handle_category_selected(callback: CallbackQuery):
+async def handle_category_selected(callback: CallbackQuery, user_profile: TelegramProfile):
     """Handle click on a category."""
     await callback.answer()
     category_id = callback.data.split(":")[1]
@@ -65,7 +65,7 @@ async def handle_category_selected(callback: CallbackQuery):
         return
 
     text = "🛍 *قائمة المنتجات المتاحة:*"
-    markup = await sync_to_async(get_products_keyboard)(products, category_id)
+    markup = await sync_to_async(get_products_keyboard)(products, category_id, user_profile.preferred_currency)
     await callback.message.edit_text(text, reply_markup=markup, parse_mode='Markdown')
 
 
@@ -169,6 +169,7 @@ async def render_quantity_selector(event: CallbackQuery | Message, product: Prod
     """Render or edit the interactive quantity adjustment card."""
     from apps.wallet.services import WalletService
     from apps.catalog.services import CatalogService
+    from apps.core.services import CurrencyService
     import html
 
     wallet = await sync_to_async(WalletService.get_or_create_wallet)(user_profile)
@@ -186,15 +187,19 @@ async def render_quantity_selector(event: CallbackQuery | Message, product: Prod
     stock_text = f"{max_stock} وحدة" if max_stock < 9000 else "متوفر بكثرة"
     balance_status = "🟢 كافٍ" if has_sufficient else "🔴 غير كافٍ"
 
+    unit_price_disp = CurrencyService.format_dual_price(unit_price_yer, user_profile.preferred_currency)
+    total_price_disp = CurrencyService.format_dual_price(total_price_yer, user_profile.preferred_currency)
+    wallet_bal_disp = CurrencyService.format_dual_price(wallet.balance_yer, user_profile.preferred_currency)
+
     text = (
         f"🛒 <b>تحديد كمية الشراء: {html.escape(product.name)}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"💰 سعر الحبة الواحدة: <b>{unit_price_yer:,.0f} YER</b>\n"
+        f"💰 سعر الحبة الواحدة: <b>{unit_price_disp}</b>\n"
         f"📦 المخزون المتاح: <b>{stock_text}</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🔢 الكمية المختارة: <b>{quantity}</b>\n"
-        f"💵 الإجمالي المطلوب: <b>{total_price_yer:,.0f} YER</b>\n"
-        f"💳 رصيد محفظتك: <b>{wallet.balance_yer:,.0f} YER</b> ({balance_status})\n"
+        f"💵 الإجمالي المطلوب: <b>{total_price_disp}</b>\n"
+        f"💳 رصيد محفظتك: <b>{wallet_bal_disp}</b> ({balance_status})\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"عدّل الكمية بالأزرار أدناه أو اكتبها بنفسك:"
     )
@@ -204,7 +209,8 @@ async def render_quantity_selector(event: CallbackQuery | Message, product: Prod
         current_qty=quantity,
         max_stock=max_stock,
         total_price_yer=float(total_price_yer),
-        has_sufficient_balance=has_sufficient
+        has_sufficient_balance=has_sufficient,
+        preferred_currency=user_profile.preferred_currency
     )
 
     if isinstance(event, CallbackQuery):
@@ -395,6 +401,9 @@ async def execute_checkout(target_msg, user_profile: TelegramProfile, product: P
         import html
         prod_name = html.escape(product.name)
 
+        from apps.core.services import CurrencyService
+        price_paid_disp = CurrencyService.format_dual_price(order.total_amount_yer, user_profile.preferred_currency)
+
         if product.fulfillment_type == 'INVENTORY':
             # Instant delivery
             if secrets:
@@ -408,7 +417,7 @@ async def execute_checkout(target_msg, user_profile: TelegramProfile, product: P
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"🔖 <b>رقم الطلب:</b> <code>{order.order_number}</code>\n"
                 f"🛍 <b>المنتج:</b> {prod_name}\n"
-                f"💰 <b>المبلغ المخصوم:</b> <b>{order.total_amount_yer:,.0f} YER</b>\n\n"
+                f"💰 <b>المبلغ المخصوم:</b> <b>{price_paid_disp}</b>\n\n"
                 f"{delivery_body}\n"
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"احتفظ بهذه البيانات، كما يمكنك الرجوع إليها دائماً من قائمة <b>📦 طلباتي</b>."
@@ -430,7 +439,7 @@ async def execute_checkout(target_msg, user_profile: TelegramProfile, product: P
                 f"━━━━━━━━━━━━━━━━━━\n"
                 f"🔖 <b>رقم الطلب:</b> <code>{order.order_number}</code>\n"
                 f"🛍 <b>المنتج:</b> {prod_name}\n"
-                f"💰 <b>المبلغ:</b> <b>{order.total_amount_yer:,.0f} YER</b>\n"
+                f"💰 <b>المبلغ:</b> <b>{price_paid_disp}</b>\n"
                 f"⚙️ الحالة: <b>جاري المعالجة والتسليم التلقائي</b>\n\n"
                 f"سيصلك إشعار فوري هنا حال اكتمال التنفيذ."
             )
