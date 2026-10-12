@@ -6,6 +6,7 @@ from apps.catalog.models import Product
 from apps.catalog.services import CatalogService
 from apps.inventory.services import InventoryService
 from apps.wallet.services import WalletService, InsufficientBalanceError
+from apps.wallet.models import Wallet
 from apps.orders.models import Order, OrderItem, OrderStatusHistory
 
 class OrderService:
@@ -17,7 +18,8 @@ class OrderService:
         user: TelegramProfile,
         product: Product,
         quantity: int = 1,
-        customer_input_data: str = ""
+        customer_input_data: str = "",
+        idempotency_key: Optional[str] = None
     ) -> Tuple[Order, List[str]]:
         """
         Execute atomic checkout:
@@ -37,6 +39,15 @@ class OrderService:
         with transaction.atomic():
             # 1. Lock customer wallet
             wallet = WalletService.get_or_create_wallet(user)
+            wallet = Wallet.objects.select_for_update().get(pk=wallet.pk)
+
+            # Telegram may deliver the same callback more than once. The
+            # wallet lock serializes purchases for this user across workers.
+            if idempotency_key:
+                existing = Order.objects.filter(idempotency_key=idempotency_key).first()
+                if existing:
+                    delivered = existing.delivered_data.splitlines() if existing.delivered_data else []
+                    return existing, delivered
             
             # Check availability before debiting
             if not CatalogService.is_in_stock(product):
@@ -48,12 +59,13 @@ class OrderService:
                 amount=total_price_yer,
                 reference_id="PENDING-ORDER",
                 description=f"شراء: {quantity}x {product.name}",
-                idempotency_key=None
+                idempotency_key=f"purchase-{idempotency_key}" if idempotency_key else None
             )
 
             # 3. Create the Order
             order = Order.objects.create(
                 user=user,
+                idempotency_key=idempotency_key,
                 total_amount_yer=total_price_yer,
                 currency_used='YER',
                 status='PENDING',

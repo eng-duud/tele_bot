@@ -9,12 +9,13 @@ class FulfillmentService:
 
     @staticmethod
     def queue_fulfillment(order: Order):
-        """Enqueue fulfillment task in Celery worker (or run directly as fallback)."""
+        """Enqueue fulfillment task in Celery; never call a provider inline."""
         try:
             execute_order_fulfillment.delay(str(order.id))
         except Exception as exc:
-            logger.warning(f"Could not queue to Celery broker ({exc}). Executing synchronously.")
-            try:
-                execute_order_fulfillment(str(order.id))
-            except Exception as sync_err:
-                logger.error(f"Synchronous fulfillment fallback also failed: {sync_err}")
+            logger.error(
+                "Could not queue fulfillment for order %s: %s. "
+                "The order remains PROCESSING for reconciliation.", order.order_number, exc
+            )
+            return False
+        return True

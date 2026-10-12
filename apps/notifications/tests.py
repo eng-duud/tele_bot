@@ -1,12 +1,12 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
-from django.test import TestCase
+from django.test import TransactionTestCase
 from apps.notifications.models import RequiredChannel
 from apps.notifications.services import ChannelSubscriptionService
 from apps.core.services import SystemSettingService
 
 
-class ChannelSubscriptionTests(TestCase):
+class ChannelSubscriptionTests(TransactionTestCase):
     def setUp(self):
         SystemSettingService.clear_cache()
         ChannelSubscriptionService.clear_cache()

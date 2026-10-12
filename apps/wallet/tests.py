@@ -17,7 +17,7 @@ class ReferralServiceTestCase(TestCase):
             full_name="المستخدم الداعي",
             username="referrer_user"
         )
-        self.referrer_wallet, _ = Wallet.objects.get_or_create(user=self.referrer)
+        self.referrer_wallet, _ = Wallet.objects.get_or_create(profile=self.referrer)
 
         self.referee = TelegramProfile.objects.create(
             telegram_id=1002,
@@ -26,7 +26,7 @@ class ReferralServiceTestCase(TestCase):
             referred_by=self.referrer,
             referral_bonus_paid=False
         )
-        self.referee_wallet, _ = Wallet.objects.get_or_create(user=self.referee)
+        self.referee_wallet, _ = Wallet.objects.get_or_create(profile=self.referee)
 
     def test_award_referral_bonus_success(self):
         initial_balance = self.referrer_wallet.balance_yer
@@ -43,10 +43,10 @@ class ReferralServiceTestCase(TestCase):
         # Verify transaction record
         tx = WalletTransaction.objects.filter(
             wallet=self.referrer_wallet,
-            transaction_type='REFERRAL_BONUS'
+            reference_id=f"REF-{self.referee.telegram_id}"
         ).first()
         self.assertIsNotNone(tx)
-        self.assertEqual(tx.amount_yer, Decimal("50.00"))
+        self.assertEqual(tx.amount, Decimal("50.00"))
 
     def test_award_referral_bonus_idempotency(self):
         # First call
@@ -55,7 +55,7 @@ class ReferralServiceTestCase(TestCase):
         bal_after_first = self.referrer_wallet.balance_yer
 
         # Second call should not double pay
-        awarded_again = ReferralService.award_referral_bonus_if_eligible(self.referee)
+        awarded_again, _ = ReferralService.award_referral_bonus_if_eligible(self.referee)
         self.assertFalse(awarded_again)
 
         self.referrer_wallet.refresh_from_db()
@@ -63,7 +63,7 @@ class ReferralServiceTestCase(TestCase):
 
     def test_award_referral_bonus_disabled_in_settings(self):
         SystemSettingService.set_setting("REFERRAL_ENABLED", "false")
-        awarded = ReferralService.award_referral_bonus_if_eligible(self.referee)
+        awarded, _ = ReferralService.award_referral_bonus_if_eligible(self.referee)
         self.assertFalse(awarded)
 
         self.referee.refresh_from_db()

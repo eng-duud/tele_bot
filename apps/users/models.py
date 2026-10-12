@@ -42,6 +42,12 @@ class TelegramProfile(TimeStampedModel):
         parts = [self.first_name, self.last_name]
         return " ".join([p for p in parts if p]).strip() or f"User-{self.telegram_id}"
 
+    @full_name.setter
+    def full_name(self, value: str) -> None:
+        """Accept legacy/import code assigning a single display name."""
+        self.first_name = (value or '').strip()
+        self.last_name = ''
+
 
 class AdminPermission(TimeStampedModel):
     """Granular permissions for RBAC."""

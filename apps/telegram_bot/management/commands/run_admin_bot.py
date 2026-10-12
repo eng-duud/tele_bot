@@ -10,6 +10,7 @@ from apps.telegram_bot.common.bot_instances import get_admin_bot
 from apps.telegram_bot.common.middlewares import (
     DatabaseConnectionMiddleware,
     UserAutoRegisterMiddleware,
+    AdminAuthMiddleware,
     force_close_db_connections,
 )
 from apps.telegram_bot.admin import handlers as admin_handlers
@@ -54,6 +55,8 @@ class Command(BaseCommand):
         dp.error.register(global_error_handler)
         dp.message.middleware(UserAutoRegisterMiddleware())
         dp.callback_query.middleware(UserAutoRegisterMiddleware())
+        dp.message.middleware(AdminAuthMiddleware())
+        dp.callback_query.middleware(AdminAuthMiddleware())
 
         # Include Admin routers
         dp.include_router(admin_handlers.router)

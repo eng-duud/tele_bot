@@ -3,6 +3,7 @@ import requests
 from decimal import Decimal
 from typing import Optional, Dict, Any, List
 from apps.providers.base import BaseFulfillmentProvider, ProviderOrderResult
+from apps.providers.http_provider import validate_provider_url
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +14,7 @@ class VenteBotProvider(BaseFulfillmentProvider):
     """
 
     def __init__(self, api_key: str, api_secret: str = "", base_url: str = ""):
-        clean_url = (base_url or "https://ventetelegrambotrailway-production.up.railway.app").rstrip('/')
+        clean_url = validate_provider_url((base_url or "https://ventetelegrambotrailway-production.up.railway.app").rstrip('/'))
         super().__init__(api_key=api_key, api_secret=api_secret, base_url=clean_url)
 
     def _get_auth_headers_list(self) -> List[Dict[str, str]]:
@@ -55,7 +56,8 @@ class VenteBotProvider(BaseFulfillmentProvider):
             call_kwargs = dict(kwargs)
             call_kwargs['headers'] = {**headers, **call_kwargs.get('headers', {})}
             try:
-                resp = requests.request(method, url, **call_kwargs)
+                call_kwargs.setdefault('allow_redirects', False)
+                resp = requests.request(method, validate_provider_url(url), **call_kwargs)
                 last_resp = resp
                 if resp.status_code not in (401, 403):
                     return resp
@@ -69,7 +71,8 @@ class VenteBotProvider(BaseFulfillmentProvider):
             params = dict(call_kwargs.get('params') or {})
             params['api_key'] = self.api_key
             call_kwargs['params'] = params
-            resp = requests.request(method, url, **call_kwargs)
+            call_kwargs.setdefault('allow_redirects', False)
+            resp = requests.request(method, validate_provider_url(url), **call_kwargs)
             return resp
         except Exception:
             return last_resp
@@ -79,7 +82,8 @@ class VenteBotProvider(BaseFulfillmentProvider):
         external_service_id: str, 
         quantity: int = 1, 
         customer_input: str = "", 
-        custom_params: Optional[Dict[str, Any]] = None
+        custom_params: Optional[Dict[str, Any]] = None,
+        idempotency_key: str = ""
     ) -> ProviderOrderResult:
         """
         Submit a purchase order to Vente API.
@@ -109,7 +113,8 @@ class VenteBotProvider(BaseFulfillmentProvider):
         for url in endpoints:
             try:
                 logger.info(f"Submitting order to Vente API: {url} with product {external_service_id}")
-                resp = self._make_request('POST', url, json=payload, timeout=30)
+                request_headers = {'Idempotency-Key': idempotency_key} if idempotency_key else {}
+                resp = self._make_request('POST', url, json=payload, headers=request_headers, timeout=30)
                 if resp is None:
                     continue
 

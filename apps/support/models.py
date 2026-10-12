@@ -8,7 +8,7 @@ from apps.users.models import TelegramProfile
 def generate_ticket_number() -> str:
     """Generate friendly and unique ticket code e.g. TIC-261011-9B3E."""
     today = timezone.now().strftime("%y%m%d")
-    entropy = secrets.token_hex(2).upper()
+    entropy = secrets.token_hex(6).upper()
     return f"TIC-{today}-{entropy}"
 
 class SupportTicket(TimeStampedModel):

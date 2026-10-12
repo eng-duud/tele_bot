@@ -6,6 +6,7 @@ from django.test import TestCase, override_settings
 from apps.catalog.models import Category, Product
 from apps.core.encryption import decrypt_data, encrypt_data
 from apps.orders.services import OrderService
+from apps.orders.models import Order
 from apps.users.models import TelegramProfile
 from apps.wallet.models import Wallet
 from apps.wallet.services import WalletService
@@ -38,6 +39,22 @@ class OrderRoutingTests(TestCase):
         self.assertEqual(delivered, [])
         queue.assert_called_once_with(order)
 
+    def test_purchase_idempotency_returns_existing_order_without_second_debit(self):
+        product = self.product("API")
+        with patch("apps.fulfillment.services.FulfillmentService.queue_fulfillment"):
+            with self.captureOnCommitCallbacks(execute=True):
+                first, _ = OrderService.process_purchase(
+                    self.profile, product, idempotency_key="checkout-retry-1"
+                )
+                second, _ = OrderService.process_purchase(
+                    self.profile, product, idempotency_key="checkout-retry-1"
+                )
+
+        self.assertEqual(first.pk, second.pk)
+        self.assertEqual(Order.objects.filter(user=self.profile).count(), 1)
+        self.wallet.refresh_from_db()
+        self.assertEqual(self.wallet.balance_yer, 900)
+
     def test_unimplemented_file_delivery_does_not_charge_wallet(self):
         product = self.product("FILE")
         with self.assertRaisesMessage(ValueError, "غير مدعوم حالياً"):
@@ -68,4 +85,3 @@ class OrderNumberGenerationTests(TestCase):
             self.assertTrue(num.startswith("ORD-"))
             self.assertNotIn(num, numbers)
             numbers.add(num)
-

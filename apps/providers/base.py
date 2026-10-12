@@ -27,7 +27,8 @@ class BaseFulfillmentProvider(ABC):
         external_service_id: str, 
         quantity: int = 1, 
         customer_input: str = "", 
-        custom_params: Optional[Dict[str, Any]] = None
+        custom_params: Optional[Dict[str, Any]] = None,
+        idempotency_key: str = ""
     ) -> ProviderOrderResult:
         """Submit a purchase order to the external provider API."""
         pass

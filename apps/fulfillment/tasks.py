@@ -1,12 +1,13 @@
 import logging
 from celery import shared_task
-from django.utils import timezone
+from django.db import transaction
 from apps.orders.models import Order
 from apps.orders.services import OrderService
 from apps.fulfillment.models import FulfillmentTask, OrderIssue
 from apps.providers.services import ProviderDispatcherService
 
 logger = logging.getLogger(__name__)
+MAX_ATTEMPTS = 3
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=15)
 def execute_order_fulfillment(self, order_id: str):
@@ -28,26 +29,31 @@ def execute_order_fulfillment(self, order_id: str):
 
     product = order_item.product
 
-    # Get or create task log
-    task, _ = FulfillmentTask.objects.get_or_create(
-        order=order,
-        defaults={
-            'status': 'RUNNING',
-            'attempts': 0,
-            'max_attempts': 3,
-            'provider_idempotency_key': f"fulfill-{order.order_number}"
-        }
-    )
-    task.attempts += 1
-    task.status = 'RUNNING'
-    task.save(update_fields=['attempts', 'status', 'updated_at'])
+    # Claim the single task row atomically. A duplicate Celery delivery must
+    # not call the external provider while another worker owns the order.
+    with transaction.atomic():
+        task, _ = FulfillmentTask.objects.get_or_create(
+            order=order,
+            defaults={
+                'status': 'QUEUED',
+                'attempts': 0,
+                'provider_idempotency_key': f"fulfill-{order.order_number}"
+            }
+        )
+        task = FulfillmentTask.objects.select_for_update().get(pk=task.pk)
+        if task.status in ('SUCCESS', 'FAILED', 'RUNNING'):
+            return f"Order {order.order_number} fulfillment is already {task.status.lower()}."
+        task.attempts += 1
+        task.status = 'RUNNING'
+        task.save(update_fields=['attempts', 'status', 'updated_at'])
 
     try:
         # Call external provider through abstraction layer
         result = ProviderDispatcherService.execute_provider_order(
             product=product,
             quantity=order_item.quantity,
-            customer_input=order.customer_input_data
+            customer_input=order.customer_input_data,
+            idempotency_key=task.provider_idempotency_key
         )
 
         if result.success:
@@ -76,10 +82,11 @@ def execute_order_fulfillment(self, order_id: str):
         task.last_error = str(exc)
         logger.warning(f"Fulfillment attempt {task.attempts} failed for {order.order_number}: {exc}")
 
-        if task.attempts < task.max_attempts:
+        if task.attempts < MAX_ATTEMPTS:
             # Exponential backoff retry: 15s, 45s, 135s...
             retry_delay = 15 * (3 ** (task.attempts - 1))
-            task.save(update_fields=['last_error', 'updated_at'])
+            task.status = 'QUEUED'
+            task.save(update_fields=['last_error', 'status', 'updated_at'])
             raise self.retry(exc=exc, countdown=retry_delay)
         else:
             # Max attempts exhausted: Perform automated idempotent refund
@@ -90,10 +97,12 @@ def execute_order_fulfillment(self, order_id: str):
             OrderService.refund_order(order, reason=f"فشل التسليم التلقائي: {str(exc)}")
 
             # Create OrderIssue for Admins
-            OrderIssue.objects.create(
+            OrderIssue.objects.update_or_create(
                 order=order,
-                issue_type='API_DELIVERY_FAILURE',
-                details=f"تكرر الفشل {task.attempts} مرات. الخطأ: {str(exc)}. تم استرجاع الرصيد للمحفظة تلقائياً."
+                defaults={
+                    'issue_type': 'API_DELIVERY_FAILURE',
+                    'details': f"تكرر الفشل {task.attempts} مرات. الخطأ: {str(exc)}. تم استرجاع الرصيد للمحفظة تلقائياً."
+                }
             )
 
             # Alert customer and admin group

@@ -69,6 +69,13 @@ class PaymentRequest(TimeStampedModel):
         verbose_name = _('طلب شحن رصيد')
         verbose_name_plural = _('طلبات شحن الرصيد')
         ordering = ['-created_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['tx_number'],
+                condition=models.Q(tx_number__gt='', status__in=['PENDING', 'APPROVED']),
+                name='unique_active_payment_tx_number',
+            ),
+        ]
 
     def __str__(self):
         return f"Payment #{str(self.id)[:8]} - {self.user} - {self.amount_yer:,.0f} YER [{self.get_status_display()}]"

@@ -41,8 +41,8 @@ class DatabaseBackupService:
             pass
 
         try:
-            from apps.inventory.models import InventoryItem
-            stats['inventory_count'] = InventoryItem.objects.count()
+            from apps.inventory.models import StockItem
+            stats['inventory_count'] = StockItem.objects.count()
         except Exception:
             pass
 

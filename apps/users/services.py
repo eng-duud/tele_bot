@@ -290,3 +290,27 @@ class AdminAuthService:
             return False
 
         return admin_profile.has_permission(permission_codename)
+
+    @staticmethod
+    def required_permission(callback_data: str = '', message_text: str = '') -> Optional[str]:
+        """Return the RBAC permission required by an admin-bot action.
+
+        This is deliberately centralized so a forged callback cannot bypass
+        the permission checks duplicated in individual handlers.
+        """
+        value = callback_data or message_text or ''
+        rules = (
+            (('adm_pay', 'adm_deposit'), 'MANAGE_PAYMENTS'),
+            (('adm_prod', 'adm_cat'), 'MANAGE_PRODUCTS'),
+            (('adm_stock', 'adm_add_stock'), 'MANAGE_INVENTORY'),
+            (('adm_ord', 'adm_orders'), 'MANAGE_ORDERS'),
+            (('adm_user', 'adm_wallet', 'adm_customer'), 'MANAGE_USERS'),
+            (('adm_service', 'adm_quote'), 'MANAGE_SERVICES'),
+            (('adm_prov', 'adm_map_api'), 'MANAGE_PROVIDERS'),
+            (('adm_setting', 'adm_exchange', 'adm_channel', 'adm_backup'), 'MANAGE_SETTINGS'),
+            (('adm_broadcast',), 'MANAGE_USERS'),
+        )
+        for prefixes, permission in rules:
+            if any(value.startswith(prefix) or prefix in value for prefix in prefixes):
+                return permission
+        return None

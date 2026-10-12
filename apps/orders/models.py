@@ -24,6 +24,10 @@ class Order(TimeStampedModel):
     )
 
     order_number = models.CharField(_('رقم الطلب'), max_length=50, unique=True, default=generate_order_number, db_index=True)
+    idempotency_key = models.CharField(
+        _('مفتاح منع تكرار الشراء'), max_length=180, unique=True,
+        null=True, blank=True, db_index=True
+    )
     user = models.ForeignKey(TelegramProfile, on_delete=models.CASCADE, related_name='orders', verbose_name=_('العميل'))
     total_amount_yer = models.DecimalField(_('المبلغ الإجمالي (YER)'), max_digits=14, decimal_places=2)
     currency_used = models.CharField(_('العملة المستخدمة'), max_length=10, default='YER')

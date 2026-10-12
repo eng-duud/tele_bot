@@ -29,9 +29,12 @@ class FulfillmentTask(TimeStampedModel):
         verbose_name = _('مهمة تسليم')
         verbose_name_plural = _('مهام التسليم')
         ordering = ['-created_at']
+        constraints = [
+            models.UniqueConstraint(fields=['order'], name='unique_fulfillment_task_per_order'),
+        ]
 
     def __str__(self):
-        return f"Fulfillment for {self.order.order_number} [{self.get_status_display()}] (Attempt: {self.attempts}/{self.max_attempts})"
+        return f"Fulfillment for {self.order.order_number} [{self.get_status_display()}] (Attempt: {self.attempts}/3)"
 
 
 class OrderIssue(TimeStampedModel):

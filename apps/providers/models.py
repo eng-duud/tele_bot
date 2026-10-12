@@ -49,8 +49,8 @@ class ApiProvider(TimeStampedModel):
             return ""
         try:
             return decrypt_data(self.api_key_encrypted)
-        except Exception:
-            return self.api_key_encrypted
+        except Exception as exc:
+            raise ValueError(f"تعذر فك تشفير مفتاح المزود {self.provider_code}.") from exc
 
     def set_api_secret(self, raw_secret: str):
         self.api_secret_encrypted = encrypt_data(raw_secret)
@@ -60,8 +60,8 @@ class ApiProvider(TimeStampedModel):
             return ""
         try:
             return decrypt_data(self.api_secret_encrypted)
-        except Exception:
-            return self.api_secret_encrypted
+        except Exception as exc:
+            raise ValueError(f"تعذر فك تشفير secret المزود {self.provider_code}.") from exc
 
 
 class ProviderProductMapping(TimeStampedModel):

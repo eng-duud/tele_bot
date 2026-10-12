@@ -24,7 +24,7 @@ class ProviderDispatcherService:
         return HttpFulfillmentProvider(api_key=api_key, api_secret=api_secret, base_url=provider.base_url)
 
     @classmethod
-    def execute_provider_order(cls, product: Product, quantity: int = 1, customer_input: str = "") -> ProviderOrderResult:
+    def execute_provider_order(cls, product: Product, quantity: int = 1, customer_input: str = "", idempotency_key: str = "") -> ProviderOrderResult:
         """Execute automated order against mapped external provider."""
         mapping = ProviderProductMapping.objects.filter(product=product).select_related('provider').first()
         if not mapping:
@@ -44,5 +44,6 @@ class ProviderDispatcherService:
             external_service_id=mapping.external_service_id,
             quantity=quantity,
             customer_input=customer_input,
-            custom_params=mapping.custom_parameters
+            custom_params=mapping.custom_parameters,
+            idempotency_key=idempotency_key
         )

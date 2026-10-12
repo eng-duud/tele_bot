@@ -10,7 +10,6 @@ from apps.catalog.models import Category, Product
 from apps.catalog.services import CatalogService
 from apps.inventory.services import InventoryService
 from apps.orders.services import OrderService
-from apps.fulfillment.services import FulfillmentService
 from apps.notifications.services import SuccessChannelService
 from apps.telegram_bot.common.keyboards import (
     get_categories_keyboard, 
@@ -282,7 +281,7 @@ async def handle_custom_qty_prompt(callback: CallbackQuery, state: FSMContext):
         return
 
     import html
-    await state.update_data(product_id=str(product.id))
+    await state.update_data(product_id=str(product.id), checkout_key=f"qty-{callback.id}")
     await state.set_state(PurchaseStates.waiting_for_quantity)
     await callback.message.answer(
         f"✍️ <b>إدخال كمية مخصصة: {html.escape(product.name)}</b>\n\n"
@@ -343,7 +342,7 @@ async def handle_confirm_buy(callback: CallbackQuery, user_profile: TelegramProf
     # Check if extra customer input is required
     if product.requires_customer_input:
         import html
-        await state.update_data(product_id=str(product.id), quantity=quantity)
+        await state.update_data(product_id=str(product.id), quantity=quantity, checkout_key=f"purchase-{callback.id}")
         await state.set_state(PurchaseStates.waiting_for_customer_input)
         prompt = product.customer_input_label or "البيانات المطلوبة (مثل: معرف الحساب أو ID اللاعب)"
         await callback.message.answer(
@@ -355,7 +354,7 @@ async def handle_confirm_buy(callback: CallbackQuery, user_profile: TelegramProf
         return
 
     # Otherwise execute purchase directly with the chosen quantity
-    await execute_checkout(callback.message, user_profile, product, quantity=quantity, customer_input="")
+    await execute_checkout(callback.message, user_profile, product, quantity=quantity, customer_input="", checkout_key=f"purchase-{callback.id}")
 
 
 @router.message(PurchaseStates.waiting_for_customer_input)
@@ -371,7 +370,7 @@ async def handle_purchase_input_received(message: Message, user_profile: Telegra
     data = await state.get_data()
     product_id = data.get("product_id")
     quantity = data.get("quantity", 1)
-    await state.clear()
+    checkout_key = data.get("checkout_key", f"purchase-msg-{message.from_user.id}-{product_id}-{quantity}")
 
     product = await sync_to_async(Product.objects.filter(id=product_id).first)()
     if not product:
@@ -379,7 +378,8 @@ async def handle_purchase_input_received(message: Message, user_profile: Telegra
         return
 
     customer_input = message.text.strip()
-    await execute_checkout(message, user_profile, product, quantity=quantity, customer_input=customer_input)
+    await execute_checkout(message, user_profile, product, quantity=quantity, customer_input=customer_input, checkout_key=checkout_key)
+    await state.clear()
 
 
 @router.callback_query(F.data == "noop")
@@ -388,14 +388,15 @@ async def handle_noop(callback: CallbackQuery):
     await callback.answer()
 
 
-async def execute_checkout(target_msg, user_profile: TelegramProfile, product: Product, quantity: int, customer_input: str):
+async def execute_checkout(target_msg, user_profile: TelegramProfile, product: Product, quantity: int, customer_input: str, checkout_key: str):
     """Atomic purchase checkout helper."""
     try:
         order, secrets = await sync_to_async(OrderService.process_purchase)(
             user=user_profile,
             product=product,
             quantity=quantity,
-            customer_input_data=customer_input
+            customer_input_data=customer_input,
+            idempotency_key=checkout_key
         )
 
         import html
@@ -432,8 +433,6 @@ async def execute_checkout(target_msg, user_profile: TelegramProfile, product: P
                 pass
 
         elif product.fulfillment_type == 'API':
-            # Queue to background worker
-            await sync_to_async(FulfillmentService.queue_fulfillment)(order)
             text = (
                 f"⏳ <b>تم تأكيد طلبك بنجاح!</b>\n"
                 f"━━━━━━━━━━━━━━━━━━\n"

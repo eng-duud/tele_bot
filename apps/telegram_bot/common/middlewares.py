@@ -169,6 +169,17 @@ class AdminAuthMiddleware(BaseMiddleware):
                 await event.answer("⛔ *عذراً، هذا البوت مخصص للمشرفين وإدارة المتجر فقط.*", parse_mode='Markdown')
             return
 
+        required = AdminAuthService.required_permission(
+            callback_data=getattr(event, 'data', '') or '',
+            message_text=getattr(event, 'text', '') or '',
+        )
+        if required and not await sync_to_async(AdminAuthService.has_permission)(user.id, required):
+            if isinstance(event, CallbackQuery):
+                await event.answer("⛔ لا تملك الصلاحية اللازمة لتنفيذ هذه العملية.", show_alert=True)
+            elif isinstance(event, Message):
+                await event.answer("⛔ لا تملك الصلاحية اللازمة لتنفيذ هذه العملية.")
+            return
+
         return await handler(event, data)
 
 

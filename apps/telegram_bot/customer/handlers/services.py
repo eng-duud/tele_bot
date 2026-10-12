@@ -80,6 +80,21 @@ async def handle_service_notes_received(message: Message, user_profile: Telegram
         customer_notes=notes
     )
 
+    if service.service_type == 'FIXED':
+        await sync_to_async(ServiceWorkflowService.set_quote)(
+            request_id=str(req.id), amount_yer=service.price_yer, valid_hours=24,
+            admin_notes='سعر ثابت محدد مسبقاً من إعدادات الخدمة.'
+        )
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"✅ قبول ودفع ({service.price_yer:,.0f} YER)", callback_data=f"accept_quote:{req.id}")],
+            [InlineKeyboardButton(text="❌ إلغاء الطلب", callback_data=f"reject_quote:{req.id}")],
+        ])
+        await message.answer(
+            f"💼 تم تجهيز عرض السعر الثابت للخدمة <b>{service.name}</b> بمبلغ <b>{service.price_yer:,.0f} YER</b>.",
+            reply_markup=markup, parse_mode='HTML'
+        )
+        return
+
     text = (
         f"✅ *تم استلام طلب الخدمة بنجاح!*\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -116,3 +131,17 @@ async def handle_accept_quote(callback: CallbackQuery, user_profile: TelegramPro
         await callback.message.edit_text(text, parse_mode='Markdown')
     else:
         await callback.message.answer(f"⚠️ {msg}")
+
+
+@router.callback_query(F.data.startswith("reject_quote:"))
+async def handle_reject_quote(callback: CallbackQuery, user_profile: TelegramProfile):
+    """Customer declines a quotation, with ownership enforced by the service."""
+    await callback.answer()
+    req_id = callback.data.split(":")[1]
+    success, msg = await sync_to_async(ServiceWorkflowService.reject_quote)(
+        request_id=req_id, user=user_profile
+    )
+    if success:
+        await callback.message.edit_text("❌ تم إلغاء عرض الخدمة بنجاح.")
+    else:
+        await callback.answer(f"⚠️ {msg}", show_alert=True)

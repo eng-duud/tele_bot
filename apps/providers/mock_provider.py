@@ -15,7 +15,8 @@ class MockFulfillmentProvider(BaseFulfillmentProvider):
         external_service_id: str, 
         quantity: int = 1, 
         customer_input: str = "", 
-        custom_params: Optional[Dict[str, Any]] = None
+        custom_params: Optional[Dict[str, Any]] = None,
+        idempotency_key: str = ""
     ) -> ProviderOrderResult:
         """Simulate creating an external API order."""
         fake_remote_id = f"EXT-{random.randint(100000, 999999)}"

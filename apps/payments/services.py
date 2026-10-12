@@ -1,6 +1,6 @@
 from decimal import Decimal
 from typing import Tuple, Optional
-from django.db import transaction
+from django.db import transaction, IntegrityError
 from django.utils import timezone
 from datetime import timedelta
 from apps.users.models import TelegramProfile
@@ -36,6 +36,8 @@ class PaymentService:
     ) -> PaymentRequest:
         """Create a new pending deposit request."""
         amount_yer = Decimal(str(amount_yer))
+        if not payment_method.is_active:
+            raise ValueError("طريقة الدفع غير متاحة حالياً.")
         if amount_yer < payment_method.min_deposit_yer:
             raise ValueError(f"المبلغ أقل من الحد الأدنى المسموح ({payment_method.min_deposit_yer:,.0f} YER).")
         if amount_yer > payment_method.max_deposit_yer:
@@ -49,15 +51,23 @@ class PaymentService:
             block_reason = PaymentService.get_top_up_block_reason(locked_user)
             if block_reason:
                 raise ValueError(block_reason)
-            return PaymentRequest.objects.create(
-                user=locked_user,
-                payment_method=payment_method,
-                amount_yer=amount_yer,
-                tx_number=tx_number.strip(),
-                proof_image_file_id=proof_image_file_id,
-                proof_image_url=proof_image_url,
-                status='PENDING'
-            )
+            tx_number = tx_number.strip().casefold()
+            if tx_number and PaymentRequest.objects.filter(
+                tx_number__iexact=tx_number, status__in=['PENDING', 'APPROVED']
+            ).exists():
+                raise ValueError("رقم العملية مستخدم مسبقاً في طلب شحن نشط.")
+            try:
+                return PaymentRequest.objects.create(
+                    user=locked_user,
+                    payment_method=payment_method,
+                    amount_yer=amount_yer,
+                    tx_number=tx_number,
+                    proof_image_file_id=proof_image_file_id,
+                    proof_image_url=proof_image_url,
+                    status='PENDING'
+                )
+            except IntegrityError as exc:
+                raise ValueError("رقم العملية مستخدم مسبقاً في طلب شحن نشط.") from exc
 
     @classmethod
     def approve_payment(

@@ -85,6 +85,7 @@ class ServiceWorkflowService:
             # Create Order
             order = Order.objects.create(
                 user=user,
+                idempotency_key=f"service-order-{req.id}",
                 total_amount_yer=amount,
                 currency_used='YER',
                 status='PROCESSING',

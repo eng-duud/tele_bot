@@ -1,10 +1,33 @@
 import logging
 import requests
+import ipaddress
+import socket
+from urllib.parse import urlparse
 from decimal import Decimal
 from typing import Optional, Dict, Any
 from apps.providers.base import BaseFulfillmentProvider, ProviderOrderResult
 
 logger = logging.getLogger(__name__)
+
+
+def validate_provider_url(url: str) -> str:
+    """Allow only external HTTPS endpoints and reject SSRF targets."""
+    parsed = urlparse((url or '').strip())
+    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError('رابط مزود API يجب أن يكون HTTPS خارجياً صالحاً.')
+    host = parsed.hostname.rstrip('.').lower()
+    if host in {'localhost', 'localhost.localdomain'}:
+        raise ValueError('لا يسمح باستخدام localhost كمزود API.')
+    try:
+        addresses = {ipaddress.ip_address(host)}
+    except ValueError:
+        try:
+            addresses = {ipaddress.ip_address(item[4][0]) for item in socket.getaddrinfo(host, None)}
+        except OSError as exc:
+            raise ValueError('تعذر التحقق من عنوان مزود API.') from exc
+    if any(addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved or addr.is_multicast for addr in addresses):
+        raise ValueError('لا يسمح لمزود API بالإشارة إلى شبكة داخلية أو عنوان محلي.')
+    return url.strip()
 
 class HttpFulfillmentProvider(BaseFulfillmentProvider):
     """
@@ -17,7 +40,8 @@ class HttpFulfillmentProvider(BaseFulfillmentProvider):
         external_service_id: str, 
         quantity: int = 1, 
         customer_input: str = "", 
-        custom_params: Optional[Dict[str, Any]] = None
+        custom_params: Optional[Dict[str, Any]] = None,
+        idempotency_key: str = ""
     ) -> ProviderOrderResult:
         """
         Send order to external provider.
@@ -33,6 +57,8 @@ class HttpFulfillmentProvider(BaseFulfillmentProvider):
             'User-Agent': 'TeleBot-Fulfillment/1.0',
             'Accept': 'application/json',
         }
+        if idempotency_key:
+            headers['Idempotency-Key'] = idempotency_key
         
         # Custom authorization header if configured
         auth_header = custom_params.get('auth_header')
@@ -40,6 +66,7 @@ class HttpFulfillmentProvider(BaseFulfillmentProvider):
             headers['Authorization'] = auth_header.replace('{api_key}', self.api_key)
 
         try:
+            endpoint = validate_provider_url(self.base_url)
             if api_format == 'json':
                 # Generic JSON POST
                 payload = {
@@ -52,7 +79,7 @@ class HttpFulfillmentProvider(BaseFulfillmentProvider):
                     payload['api_key'] = self.api_key
 
                 headers['Content-Type'] = 'application/json'
-                response = requests.post(self.base_url, json=payload, headers=headers, timeout=timeout)
+                response = requests.post(endpoint, json=payload, headers=headers, timeout=timeout, allow_redirects=False)
             else:
                 # Default: Standard SMM Panel / Form-encoded API v2
                 payload = {
@@ -63,7 +90,7 @@ class HttpFulfillmentProvider(BaseFulfillmentProvider):
                     'quantity': quantity,
                     **custom_params.get('extra_fields', {})
                 }
-                response = requests.post(self.base_url, data=payload, headers=headers, timeout=timeout)
+                response = requests.post(endpoint, data=payload, headers=headers, timeout=timeout, allow_redirects=False)
 
             # Parse response
             try:
@@ -113,7 +140,7 @@ class HttpFulfillmentProvider(BaseFulfillmentProvider):
         """Query remote order status."""
         try:
             payload = {'key': self.api_key, 'action': 'status', 'order': provider_order_id}
-            resp = requests.post(self.base_url, data=payload, timeout=15)
+            resp = requests.post(validate_provider_url(self.base_url), data=payload, timeout=15, allow_redirects=False)
             data = resp.json()
             return ProviderOrderResult(success=True, provider_order_id=provider_order_id, raw_response=data)
         except Exception as e:
@@ -123,7 +150,7 @@ class HttpFulfillmentProvider(BaseFulfillmentProvider):
         """Query account balance on remote provider."""
         try:
             payload = {'key': self.api_key, 'action': 'balance'}
-            resp = requests.post(self.base_url, data=payload, timeout=15)
+            resp = requests.post(validate_provider_url(self.base_url), data=payload, timeout=15, allow_redirects=False)
             data = resp.json()
             val = data.get('balance', '0')
             return Decimal(str(val))
