@@ -1,5 +1,8 @@
 import os
+import sys
 from pathlib import Path
+from django.core.exceptions import ImproperlyConfigured
+from django.core.management.utils import get_random_secret_key
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -15,11 +18,25 @@ if env_path.exists():
             k, v = line.split('=', 1)
             os.environ.setdefault(k.strip(), v.strip().strip("'").strip('"'))
 
-SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-dev-key-change-in-production')
 DEBUG = os.getenv('DEBUG', 'False').lower() in ('true', '1', 't')
+SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', '').strip()
+if not SECRET_KEY:
+    if DEBUG or 'test' in sys.argv:
+        SECRET_KEY = get_random_secret_key()
+    else:
+        raise ImproperlyConfigured('DJANGO_SECRET_KEY must be set when DEBUG=False.')
 
 ALLOWED_HOSTS = [host.strip() for host in os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',') if host.strip()]
 CSRF_TRUSTED_ORIGINS = [origin.strip() for origin in os.getenv('CSRF_TRUSTED_ORIGINS', 'http://127.0.0.1,http://localhost').split(',') if origin.strip()]
+
+# Production security defaults. Set SECURE_SSL_REDIRECT=False only for a
+# deliberately HTTP-only local environment; never weaken production defaults.
+SECURE_SSL_REDIRECT = os.getenv('SECURE_SSL_REDIRECT', 'False' if DEBUG else 'True').lower() in ('true', '1', 't')
+SECURE_HSTS_SECONDS = int(os.getenv('SECURE_HSTS_SECONDS', '0' if DEBUG else '31536000'))
+SECURE_HSTS_INCLUDE_SUBDOMAINS = os.getenv('SECURE_HSTS_INCLUDE_SUBDOMAINS', 'True' if not DEBUG else 'False').lower() in ('true', '1', 't')
+SECURE_HSTS_PRELOAD = os.getenv('SECURE_HSTS_PRELOAD', 'True' if not DEBUG else 'False').lower() in ('true', '1', 't')
+SESSION_COOKIE_SECURE = os.getenv('SESSION_COOKIE_SECURE', 'False' if DEBUG else 'True').lower() in ('true', '1', 't')
+CSRF_COOKIE_SECURE = os.getenv('CSRF_COOKIE_SECURE', 'False' if DEBUG else 'True').lower() in ('true', '1', 't')
 
 # Application definition
 INSTALLED_APPS = [
