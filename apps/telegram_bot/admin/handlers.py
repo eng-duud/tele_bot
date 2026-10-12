@@ -2143,8 +2143,7 @@ async def handle_toggle_base_currency(callback: CallbackQuery):
 @router.callback_query(F.data == "adm_success_ch_view")
 async def handle_success_channel_view(callback: CallbackQuery):
     """View and manage success/activations channel settings."""
-    callback.data = "adm_slot_view:SUCCESS"
-    await handle_slot_view(callback)
+    await handle_slot_view(callback, slot_key="SUCCESS")
 
 
 @router.callback_query(F.data == "adm_toggle_success_ch")
@@ -2184,7 +2183,7 @@ async def handle_save_success_ch_id(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="⚙️ العودة للإعدادات", callback_data="adm_settings_view")]
     ])
     await message.answer(
-        f"✅ تم تحديث معرف قناة التفعيلات إلى: <code>{html.escape(clean_id)}</code>\n\n{audit.report}",
+        f"✅ تم تحديث معرف قناة التفعيلات إلى: <code>{html.escape(clean_id)}</code>\n\n{audit.get('report_text', '')}",
         reply_markup=markup,
         parse_mode='HTML'
     )
@@ -2251,10 +2250,10 @@ async def handle_test_success_channel(callback: CallbackQuery):
     audit = await ChannelAuditService.audit_channel(bot, ch_id, 'SUCCESS')
 
     test_msg_status = ""
-    if audit.is_admin and audit.can_post:
+    if audit.get('is_admin') and audit.get('can_post'):
         try:
             sent = await bot.send_message(
-                chat_id=audit.clean_id,
+                chat_id=audit.get('chat_id', ch_id),
                 text="🧪 <b>رسالة فحص تجريبية من لوحة الإدارة</b> ✅\nالبوت متصل بقناة التفعيلات بنجاح ولديه صلاحيات المشرف الكاملة.",
                 parse_mode='HTML'
             )
@@ -2267,7 +2266,7 @@ async def handle_test_success_channel(callback: CallbackQuery):
         [InlineKeyboardButton(text="⚙️ العودة للإعدادات", callback_data="adm_settings_view")]
     ])
     await callback.message.answer(
-        f"{audit.report}{test_msg_status}",
+        f"{audit.get('report_text', '')}{test_msg_status}",
         reply_markup=markup,
         parse_mode='HTML'
     )
@@ -2372,7 +2371,8 @@ async def handle_admin_run_backup_now(callback: CallbackQuery):
     await callback.answer("⏳ جاري إنشاء النسخة الاحتياطية وإرسالها...", show_alert=True)
     status_msg = await callback.message.answer("⏳ <i>جاري إنشاء وتجهيز النسخة الاحتياطية لقاعدة البيانات الآن...</i>", parse_mode='HTML')
 
-    success, msg = await DatabaseBackupService.send_backup_to_telegram()
+    fallback_chat = str(callback.message.chat.id) if (callback.message and callback.message.chat) else None
+    success, msg = await DatabaseBackupService.send_backup_to_telegram(fallback_chat_id=fallback_chat)
 
     if success:
         markup = InlineKeyboardMarkup(inline_keyboard=[
@@ -2664,7 +2664,7 @@ async def handle_channels_list(event: Message | CallbackQuery):
         f"💡 <i>اختر القناة المراد إعدادها أو تعديل رابطها وصلاحياتها:</i>"
     )
 
-    markup = InlineKeyboardMarkup(inline_keyboard=[
+    buttons_list = [
         [
             InlineKeyboardButton(text="📢 ضبط قناة البوت", callback_data="adm_slot_view:OFFICIAL"),
             InlineKeyboardButton(text="⚡ ضبط قناة التفعيلات", callback_data="adm_slot_view:SUCCESS"),
@@ -2673,6 +2673,14 @@ async def handle_channels_list(event: Message | CallbackQuery):
             InlineKeyboardButton(text="🎧 ضبط قناة الدعم", callback_data="adm_slot_view:SUPPORT"),
             InlineKeyboardButton(text="🛡️ ضبط قروب الإدارة", callback_data="adm_slot_view:ADMIN"),
         ],
+    ]
+
+    for ch in custom_channels:
+        buttons_list.append([
+            InlineKeyboardButton(text=f"🗑️ حذف: {ch.channel_title[:22]}", callback_data=f"adm_ch_del:{ch.id}")
+        ])
+
+    buttons_list.extend([
         [
             InlineKeyboardButton(text="➕ إضافة قناة اشتراك إضافية", callback_data="adm_ch_add"),
         ],
@@ -2688,6 +2696,8 @@ async def handle_channels_list(event: Message | CallbackQuery):
         ]
     ])
 
+    markup = InlineKeyboardMarkup(inline_keyboard=buttons_list)
+
     if isinstance(event, CallbackQuery):
         await target.edit_text(text, reply_markup=markup, parse_mode='HTML')
     else:
@@ -2695,10 +2705,19 @@ async def handle_channels_list(event: Message | CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("adm_slot_view:"))
-async def handle_slot_view(callback: CallbackQuery):
+async def handle_slot_view(callback: CallbackQuery, slot_key: Optional[str] = None):
     """View details and management actions for a specific channel slot."""
-    await callback.answer()
-    slot_key = callback.data.split(":")[1]
+    try:
+        await callback.answer()
+    except Exception:
+        pass
+
+    if not slot_key:
+        if callback.data and ":" in callback.data:
+            slot_key = callback.data.split(":")[1]
+        else:
+            slot_key = "OFFICIAL"
+
     meta = SLOT_METADATA.get(slot_key)
     if not meta:
         await callback.message.answer("⚠️ دور القناة غير معروف.")
@@ -2759,7 +2778,11 @@ async def handle_slot_view(callback: CallbackQuery):
     buttons.append([InlineKeyboardButton(text="🔙 العودة لمدير القنوات", callback_data="adm_channels_list")])
 
     markup = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await callback.message.edit_text(text, reply_markup=markup, parse_mode='HTML')
+    try:
+        await callback.message.edit_text(text, reply_markup=markup, parse_mode='HTML')
+    except Exception as edit_err:
+        if "message is not modified" not in str(edit_err).lower():
+            await callback.message.answer(text, reply_markup=markup, parse_mode='HTML')
 
 
 @router.callback_query(F.data.startswith("adm_slot_edit:"))
@@ -2884,7 +2907,7 @@ async def handle_slot_toggle_mand(callback: CallbackQuery):
 
     label = "معطّل (اختياري)" if current else "مفعّل (إجباري)"
     await callback.answer(f"تم تعديل الاشتراك في {meta['name']} إلى: {label}", show_alert=True)
-    await handle_slot_view(callback)
+    await handle_slot_view(callback, slot_key=slot_key)
 
 
 @router.callback_query(F.data == "adm_slot_toggle_publish:SUCCESS")
@@ -2894,7 +2917,7 @@ async def handle_slot_toggle_publish(callback: CallbackQuery):
     new_val = "false" if current else "true"
     await sync_to_async(SystemSettingService.set_setting)('SUCCESS_CHANNEL_ENABLED', new_val, "نشر عمليات الشراء في قناة التفعيلات")
     await callback.answer(f"تم {'تعطيل' if current else 'تفعيل'} النشر التلقائي في قناة التفعيلات!")
-    await handle_slot_view(callback)
+    await handle_slot_view(callback, slot_key="SUCCESS")
 
 
 @router.callback_query(F.data.startswith("adm_slot_test:"))

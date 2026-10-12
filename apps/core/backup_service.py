@@ -86,7 +86,7 @@ class DatabaseBackupService:
         return compressed_bytes, filename, stats
 
     @classmethod
-    async def send_backup_to_telegram(cls, target_chat_id: str = None) -> Tuple[bool, str]:
+    async def send_backup_to_telegram(cls, target_chat_id: str = None, fallback_chat_id: str = None) -> Tuple[bool, str]:
         """
         Create backup and send it as a document to the designated Telegram backup channel or admin.
         """
@@ -101,6 +101,12 @@ class DatabaseBackupService:
         if not target_chat_id:
             target_chat_id = await sync_to_async(SystemSettingService.get_setting)('BACKUP_CHANNEL_ID', '')
         
+        if not target_chat_id:
+            target_chat_id = await sync_to_async(SystemSettingService.get_setting)('ADMIN_LOG_CHANNEL_ID', '')
+
+        if not target_chat_id and fallback_chat_id:
+            target_chat_id = str(fallback_chat_id)
+
         if not target_chat_id:
             super_admin = getattr(settings, 'SUPER_ADMIN_TELEGRAM_ID', 0)
             if super_admin:
@@ -154,5 +160,12 @@ class DatabaseBackupService:
             return True, f"تم إنشاء وإرسال النسخة الاحتياطية بنجاح إلى: <code>{target_chat_id}</code> بحجم {size_kb:,.1f} KB"
 
         except Exception as e:
-            logger.error(f"❌ Failed to dispatch database backup: {e}", exc_info=True)
-            return False, f"فشل إرسال النسخة الاحتياطية: {str(e)}"
+            err_str = str(e)
+            if "chat not found" in err_str.lower():
+                msg = f"المحادثة أو القناة ({target_chat_id}) غير موجودة أو لم تقم بمراسلة البوت بعد (chat not found). أرسل /start لبوت الإدارة أو اربط القناة أولاً."
+            elif "blocked by the user" in err_str.lower():
+                msg = f"البوت محظور من قبل المستخدم ({target_chat_id})."
+            else:
+                msg = f"فشل إرسال النسخة الاحتياطية: {err_str}"
+            logger.error(f"❌ Failed to dispatch database backup: {err_str}")
+            return False, msg
